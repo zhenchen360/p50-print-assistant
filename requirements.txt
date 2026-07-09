@@ -1,3 +1,2 @@
-bleak
-pillow
-pyinstaller
+bleak==3.0.2
+pillow==10.4.0

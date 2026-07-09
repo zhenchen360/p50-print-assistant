@@ -10,6 +10,7 @@ $PortableDir = Join-Path $RepoRoot "portable"
 $BuildDir = Join-Path $RepoRoot ".build\pyinstaller"
 $SpecDir = Join-Path $BuildDir "spec"
 $SharedRuntimeDir = Join-Path $PortableDir "p50_ble_runtime"
+$BuildVenvDir = Join-Path $RepoRoot ".build\build-venv"
 
 function Add-PythonCandidate($list, $seen, [string]$fileName, [string[]]$prefixArguments) {
     if (-not $fileName -or -not (Test-Path -LiteralPath $fileName)) { return }
@@ -61,6 +62,7 @@ function Build-Helper($python, [string]$scriptName, [string]$exeName) {
         "--noconfirm",
         "--clean",
         "--onedir",
+        "--contents-directory", ".",
         "--name", $name,
         "--distpath", $PortableDir,
         "--workpath", $BuildDir,
@@ -86,18 +88,11 @@ function Build-Helper($python, [string]$scriptName, [string]$exeName) {
     return $exePath
 }
 
-function Merge-HelperRuntimes([string]$probeExe, [string]$sessionExe) {
-    $probeDir = Split-Path -Parent $probeExe
+function Publish-SessionRuntime([string]$sessionExe) {
     $sessionDir = Split-Path -Parent $sessionExe
     Remove-Item -LiteralPath $SharedRuntimeDir -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $SharedRuntimeDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $sessionDir "_internal") -Destination (Join-Path $SharedRuntimeDir "_internal") -Recurse
-    Copy-Item -LiteralPath $probeExe -Destination (Join-Path $SharedRuntimeDir "p50_ble_probe.exe")
-    Copy-Item -LiteralPath $sessionExe -Destination (Join-Path $SharedRuntimeDir "p50_ble_session.exe")
-    Remove-Item -LiteralPath $probeDir -Recurse -Force
-    Remove-Item -LiteralPath $sessionDir -Recurse -Force
+    Move-Item -LiteralPath $sessionDir -Destination $SharedRuntimeDir
     return [pscustomobject]@{
-        Probe = Join-Path $SharedRuntimeDir "p50_ble_probe.exe"
         Session = Join-Path $SharedRuntimeDir "p50_ble_session.exe"
         Runtime = $SharedRuntimeDir
     }
@@ -105,19 +100,36 @@ function Merge-HelperRuntimes([string]$probeExe, [string]$sessionExe) {
 
 New-Item -ItemType Directory -Force -Path $PortableDir, $BuildDir, $SpecDir | Out-Null
 
-$python = Get-PythonLauncher
+if ($SkipPipInstall) {
+    $python = Get-PythonLauncher
+    Ensure-PythonPackage $python "bleak" "bleak"
+    Ensure-PythonPackage $python "PIL" "pillow"
+    Ensure-PythonPackage $python "PyInstaller" "pyinstaller"
+} else {
+    $bootstrapPython = Get-PythonLauncher
+    $repoFullPath = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\') + '\'
+    $venvFullPath = [System.IO.Path]::GetFullPath($BuildVenvDir)
+    if (-not $venvFullPath.StartsWith($repoFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build virtual environment must stay inside the repository."
+    }
+    if (Test-Path -LiteralPath $BuildVenvDir) {
+        Remove-Item -LiteralPath $BuildVenvDir -Recurse -Force
+    }
+    Invoke-Python $bootstrapPython @("-m", "venv", $BuildVenvDir)
+    $venvPython = Join-Path $BuildVenvDir "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $venvPython)) {
+        throw "Build virtual environment did not create Python: $venvPython"
+    }
+    $python = [pscustomobject]@{ FileName = $venvPython; PrefixArguments = @() }
+    Invoke-Python $python @("-m", "pip", "install", "-r", (Join-Path $RepoRoot "requirements-dev.txt"))
+}
+
 Write-Host "Build Python: $($python.FileName) $($python.PrefixArguments -join ' ')"
 
-Ensure-PythonPackage $python "bleak" "bleak"
-Ensure-PythonPackage $python "PIL" "pillow"
-Ensure-PythonPackage $python "PyInstaller" "pyinstaller"
-
-$probeExe = Build-Helper $python "p50_ble_probe.py" "p50_ble_probe.exe"
 $sessionExe = Build-Helper $python "p50_ble_session.py" "p50_ble_session.exe"
-$runtime = Merge-HelperRuntimes $probeExe $sessionExe
+$runtime = Publish-SessionRuntime $sessionExe
 
 Write-Host ""
 Write-Host "Portable BLE runtime created:"
 Write-Host "  $($runtime.Runtime)"
-Write-Host "  $($runtime.Probe)"
 Write-Host "  $($runtime.Session)"

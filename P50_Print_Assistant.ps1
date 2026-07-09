@@ -1,5 +1,6 @@
 ﻿param(
     [switch]$SelfTest,
+    [switch]$BleIpcSelfTest,
     [switch]$ProbeClipboard,
     [string]$ProbeLabelSize = "30 x 15 mm",
     [string]$RenderUiSnapshot = "",
@@ -84,6 +85,11 @@ $script:bleSessionRequestId = 0
 $script:bleSessionConnected = $false
 $script:bleSessionAddress = ""
 $script:bleSessionName = ""
+$script:bleSessionReadTask = $null
+$script:bleSessionCommandInProgress = $false
+$script:bleUiBusy = $false
+$script:lastBleSessionResponse = $null
+$script:bleSessionScriptOverride = ""
 $script:suppressThresholdChanged = $false
 $script:bleDevices = @{}
 
@@ -544,6 +550,7 @@ function Set-CurrentImage([System.Drawing.Image]$image, [string]$source, [bool]$
     $state.ThresholdManuallyAdjusted = $false
     Set-AutoThresholdFromCurrentImage
     Update-Preview
+    Update-BleSessionUi
 }
 
 function Get-ClipboardFormatSummary {
@@ -1021,6 +1028,7 @@ function Get-PortableBleHelperPath([string]$exeName) {
     $baseDir = Get-BaseDir
     $stem = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
     $candidatePaths = @(
+        (Join-Path (Join-Path $baseDir "runtime") $exeName),
         (Join-Path (Join-Path (Join-Path $baseDir "portable") "p50_ble_runtime") $exeName),
         (Join-Path (Join-Path $baseDir "portable") $exeName),
         (Join-Path (Join-Path (Join-Path $baseDir "portable") $stem) $exeName),
@@ -1046,9 +1054,8 @@ function Get-BlePythonScriptPath([string]$scriptName) {
 }
 
 function Get-BleRuntimeSummary {
-    $probeExe = Get-PortableBleHelperPath "p50_ble_probe.exe"
     $sessionExe = Get-PortableBleHelperPath "p50_ble_session.exe"
-    if ($probeExe -and $sessionExe) {
+    if ($sessionExe) {
         return "便携蓝牙运行时 OK：$sessionExe"
     }
     try {
@@ -1059,46 +1066,21 @@ function Get-BleRuntimeSummary {
     }
 }
 
-function Invoke-P50BleProbe([string[]]$Arguments) {
-    $baseDir = Get-BaseDir
-    $probeExe = Get-PortableBleHelperPath "p50_ble_probe.exe"
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    if ($probeExe) {
-        $psi.FileName = $probeExe
-        $allArgs = @($Arguments)
-    } else {
-        $probePath = Get-BlePythonScriptPath "p50_ble_probe.py"
-        if (-not $probePath) { throw "BLE probe script not found. Expected p50_ble_probe.py in the app folder or src folder." }
-        $python = Get-PythonLauncherWithBleDependencies
-        $psi.FileName = $python.FileName
-        $allArgs = @($python.PrefixArguments) + @($probePath) + $Arguments
-    }
-    $psi.Arguments = ($allArgs | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
-    $psi.WorkingDirectory = $baseDir
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    [void]$proc.Start()
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-    return [pscustomobject]@{ ExitCode = $proc.ExitCode; StdOut = $stdout; StdErr = $stderr; FileName = $psi.FileName; Arguments = $psi.Arguments }
-}
-
 function Start-P50BleSessionHelper {
     if ($null -ne $script:bleSessionProcess -and -not $script:bleSessionProcess.HasExited) { return }
     $baseDir = Get-BaseDir
     $sessionExe = Get-PortableBleHelperPath "p50_ble_session.exe"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    if ($sessionExe) {
+    if ($script:bleSessionScriptOverride) {
+        $python = Get-PythonLauncherWithBleDependencies
+        $psi.FileName = $python.FileName
+        $allArgs = @($python.PrefixArguments) + @($script:bleSessionScriptOverride)
+    } elseif ($sessionExe) {
         $psi.FileName = $sessionExe
         $allArgs = @()
     } else {
         $sessionPath = Get-BlePythonScriptPath "p50_ble_session.py"
-        if (-not $sessionPath) { throw "BLE session helper not found. Expected p50_ble_session.py in the app folder or src folder." }
+        if (-not $sessionPath) { throw "缺少蓝牙会话组件 p50_ble_session.py。" }
         $python = Get-PythonLauncherWithBleDependencies
         $psi.FileName = $python.FileName
         $allArgs = @($python.PrefixArguments) + @($sessionPath)
@@ -1114,6 +1096,7 @@ function Start-P50BleSessionHelper {
     $proc.StartInfo = $psi
     [void]$proc.Start()
     $script:bleSessionProcess = $proc
+    $script:bleSessionReadTask = $null
     $script:bleSessionConnected = $false
 }
 
@@ -1121,58 +1104,97 @@ function Test-P50BleSessionProcessAlive {
     return ($null -ne $script:bleSessionProcess -and -not $script:bleSessionProcess.HasExited)
 }
 
-function Invoke-P50BleSessionCommand([hashtable]$Payload, [int]$TimeoutMs = 45000) {
-    Start-P50BleSessionHelper
-    if (-not (Test-P50BleSessionProcessAlive)) { throw "BLE session helper is not running." }
-    $script:bleSessionRequestId++
-    $Payload["id"] = $script:bleSessionRequestId
-    $json = $Payload | ConvertTo-Json -Compress -Depth 8
-    $script:bleSessionProcess.StandardInput.WriteLine($json)
-    $script:bleSessionProcess.StandardInput.Flush()
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if ($script:bleSessionProcess.HasExited) {
-            $stderr = $script:bleSessionProcess.StandardError.ReadToEnd()
-            throw "BLE session helper exited unexpectedly.`r`n$stderr"
+function Reset-P50BleSessionHelper([bool]$Terminate = $false) {
+    $process = $script:bleSessionProcess
+    if ($null -ne $process) {
+        if ($Terminate -and -not $process.HasExited) {
+            try { $process.Kill() } catch {}
+            try { [void]$process.WaitForExit(2000) } catch {}
         }
-        $lineTask = $script:bleSessionProcess.StandardOutput.ReadLineAsync()
-        while (-not $lineTask.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 20
+        if ($process.HasExited) {
+            try { $process.Dispose() } catch {}
         }
-        if (-not $lineTask.IsCompleted) { break }
-        $line = $lineTask.Result
-        if (-not $line) { continue }
-        try { $response = $line | ConvertFrom-Json } catch { continue }
-        if ([int]$response.id -ne $script:bleSessionRequestId) { continue }
-        if (-not $response.ok) {
-            $logText = if ($response.logs) { ($response.logs -join "`r`n") } else { "" }
-            $traceText = if ($response.traceback) { "`r`n`r`n$($response.traceback)" } else { "" }
-            $parts = New-Object System.Collections.ArrayList
-            if ($response.error) { [void]$parts.Add($response.error) }
-            if ($logText) { [void]$parts.Add($logText) }
-            throw (($parts -join "`r`n") + $traceText)
-        }
-        return $response
     }
-    throw "Timed out waiting for BLE session helper response."
+    $script:bleSessionProcess = $null
+    $script:bleSessionReadTask = $null
+    $script:bleSessionConnected = $false
+    $script:bleSessionAddress = ""
+    $script:bleSessionName = ""
+}
+
+function Invoke-P50BleSessionCommand([hashtable]$Payload, [int]$TimeoutMs = 45000) {
+    if ($script:bleSessionCommandInProgress) {
+        throw "蓝牙正在执行另一项操作，请等待当前操作完成。"
+    }
+    $script:bleSessionCommandInProgress = $true
+    try {
+        Start-P50BleSessionHelper
+        if (-not (Test-P50BleSessionProcessAlive)) { throw "蓝牙会话组件未运行。" }
+        $script:bleSessionRequestId++
+        $requestId = $script:bleSessionRequestId
+        $script:lastBleSessionResponse = $null
+        $Payload["id"] = $requestId
+        $json = $Payload | ConvertTo-Json -Compress -Depth 8
+        $script:bleSessionProcess.StandardInput.WriteLine($json)
+        $script:bleSessionProcess.StandardInput.Flush()
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($script:bleSessionProcess.HasExited) {
+                $stderr = $script:bleSessionProcess.StandardError.ReadToEnd()
+                Reset-P50BleSessionHelper
+                throw "蓝牙会话组件意外退出。`r`n$stderr"
+            }
+            if ($null -eq $script:bleSessionReadTask) {
+                $script:bleSessionReadTask = $script:bleSessionProcess.StandardOutput.ReadLineAsync()
+            }
+            while (-not $script:bleSessionReadTask.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 20
+            }
+            if (-not $script:bleSessionReadTask.IsCompleted) { break }
+            $line = $script:bleSessionReadTask.Result
+            $script:bleSessionReadTask = $null
+            if ($null -eq $line) {
+                $stderr = if ($script:bleSessionProcess.HasExited) { $script:bleSessionProcess.StandardError.ReadToEnd() } else { "" }
+                Reset-P50BleSessionHelper $true
+                throw "蓝牙会话组件意外关闭了通信通道。`r`n$stderr"
+            }
+            if (-not $line.Trim()) { continue }
+            try { $response = $line | ConvertFrom-Json } catch { continue }
+            if ([int]$response.id -ne $requestId) { continue }
+            if (-not $response.ok) {
+                $script:lastBleSessionResponse = $response
+                $message = if ($response.error) { [string]$response.error } else { "蓝牙会话操作失败。" }
+                throw $message
+            }
+            return $response
+        }
+        Reset-P50BleSessionHelper $true
+        throw "等待蓝牙会话响应超时，连接已重置，请重新连接后再试。"
+    } finally {
+        $script:bleSessionCommandInProgress = $false
+    }
 }
 
 function Stop-P50BleSessionHelper {
     if (-not (Test-P50BleSessionProcessAlive)) {
-        $script:bleSessionConnected = $false
+        Reset-P50BleSessionHelper
+        return
+    }
+    if ($script:bleSessionCommandInProgress) {
+        Reset-P50BleSessionHelper $true
         return
     }
     try {
         [void](Invoke-P50BleSessionCommand @{ cmd = "disconnect" } 15000)
         [void](Invoke-P50BleSessionCommand @{ cmd = "exit" } 5000)
     } catch {
-        try { $script:bleSessionProcess.Kill() } catch {}
+        Reset-P50BleSessionHelper $true
     } finally {
-        $script:bleSessionConnected = $false
-        $script:bleSessionAddress = ""
-        $script:bleSessionName = ""
-        $script:bleSessionProcess = $null
+        if (Test-P50BleSessionProcessAlive) {
+            try { [void]$script:bleSessionProcess.WaitForExit(1000) } catch {}
+        }
+        Reset-P50BleSessionHelper (Test-P50BleSessionProcessAlive)
     }
 }
 
@@ -1197,13 +1219,15 @@ function Set-ButtonEnabledVisual($button, [bool]$enabled, [System.Drawing.Color]
 function Update-BleSessionUi {
     $connectColor = [System.Drawing.Color]::FromArgb(31, 96, 152)
     $printColor = [System.Drawing.Color]::FromArgb(19, 121, 95)
+    $available = (-not $script:bleUiBusy)
     $hasDevice = ($null -ne $script:bleDeviceCombo -and $script:bleDeviceCombo.SelectedItem -ne $null)
-    if ($null -ne $script:bleConnectButton) { Set-ButtonEnabledVisual $script:bleConnectButton ($hasDevice -and -not $script:bleSessionConnected) $connectColor }
-    if ($null -ne $script:bleDisconnectButton) { Set-ButtonEnabledVisual $script:bleDisconnectButton $script:bleSessionConnected ([System.Drawing.Color]::FromArgb(102, 112, 128)) }
-    if ($null -ne $script:blePrintButton) { Set-ButtonEnabledVisual $script:blePrintButton ($script:bleSessionConnected -and (Test-LabelSizeSelected)) $printColor }
-    if ($null -ne $script:bleDeviceCombo) { $script:bleDeviceCombo.Enabled = (-not $script:bleSessionConnected) }
-    if ($null -ne $script:bleScanButton) { Set-ButtonEnabledVisual $script:bleScanButton (-not $script:bleSessionConnected) $connectColor }
-    if ($null -ne $script:blePairCheck) { $script:blePairCheck.Enabled = (-not $script:bleSessionConnected) }
+    $hasImage = ($null -ne $state.Image)
+    if ($null -ne $script:bleConnectButton) { Set-ButtonEnabledVisual $script:bleConnectButton ($available -and $hasDevice -and -not $script:bleSessionConnected) $connectColor }
+    if ($null -ne $script:bleDisconnectButton) { Set-ButtonEnabledVisual $script:bleDisconnectButton ($available -and $script:bleSessionConnected) ([System.Drawing.Color]::FromArgb(102, 112, 128)) }
+    if ($null -ne $script:blePrintButton) { Set-ButtonEnabledVisual $script:blePrintButton ($available -and $script:bleSessionConnected -and $hasImage -and (Test-LabelSizeSelected)) $printColor }
+    if ($null -ne $script:bleDeviceCombo) { $script:bleDeviceCombo.Enabled = ($available -and -not $script:bleSessionConnected) }
+    if ($null -ne $script:bleScanButton) { Set-ButtonEnabledVisual $script:bleScanButton ($available -and -not $script:bleSessionConnected) $connectColor }
+    if ($null -ne $script:blePairCheck) { $script:blePairCheck.Enabled = ($available -and -not $script:bleSessionConnected) }
 }
 
 function Update-ImportUi {
@@ -1216,24 +1240,15 @@ function Update-ImportUi {
     }
 }
 
-function Convert-JsonRows([string]$jsonText) {
-    if (-not $jsonText -or -not $jsonText.Trim()) { return @() }
-    $parsed = $jsonText | ConvertFrom-Json
-    if ($null -eq $parsed) { return @() }
-    if ($parsed -is [System.Array]) { return @($parsed) }
-    return @($parsed)
-}
-
 function Scan-P50BleDevices {
-    if ($null -eq $script:bleDeviceCombo) { return }
-    $script:bleScanButton.Enabled = $false
-    $script:bleConnectButton.Enabled = $false
+    if ($null -eq $script:bleDeviceCombo -or $script:bleUiBusy) { return }
+    $script:bleUiBusy = $true
+    Update-BleSessionUi
     $script:statusLabel.Text = "正在扫描 P50 蓝牙设备..."
     [System.Windows.Forms.Application]::DoEvents()
     try {
-        $result = Invoke-P50BleProbe @("scan", "--timeout", "3", "--json")
-        if ($result.ExitCode -ne 0 -and -not $result.StdOut.Trim()) { throw ($result.StdErr.Trim()) }
-        $rows = if ($result.StdOut.Trim()) { Convert-JsonRows $result.StdOut } else { @() }
+        $response = Invoke-P50BleSessionCommand @{ cmd = "scan"; timeout = 3 } 15000
+        $rows = @($response.result.devices)
         $script:bleDevices = @{}
         $script:bleDeviceCombo.Items.Clear()
         foreach ($row in $rows) {
@@ -1253,11 +1268,13 @@ function Scan-P50BleDevices {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "蓝牙扫描失败") | Out-Null
         $script:statusLabel.Text = "蓝牙扫描失败。"
     } finally {
+        $script:bleUiBusy = $false
         Update-BleSessionUi
     }
 }
 
 function Connect-P50BleSession {
+    if ($script:bleUiBusy) { return }
     if ($null -eq $script:bleDeviceCombo -or $script:bleDeviceCombo.SelectedItem -eq $null) {
         [System.Windows.Forms.MessageBox]::Show("请先扫描并选择 P50 蓝牙设备。", "P50 打印助手") | Out-Null
         return
@@ -1268,7 +1285,8 @@ function Connect-P50BleSession {
         [System.Windows.Forms.MessageBox]::Show("所选蓝牙设备没有地址。", "P50 打印助手") | Out-Null
         return
     }
-    $script:bleConnectButton.Enabled = $false
+    $script:bleUiBusy = $true
+    Update-BleSessionUi
     $script:statusLabel.Text = "正在连接蓝牙设备，并保持连接..."
     [System.Windows.Forms.Application]::DoEvents()
     try {
@@ -1285,15 +1303,17 @@ function Connect-P50BleSession {
         Stop-P50BleSessionHelper
         $script:statusLabel.Text = "蓝牙连接失败。"
     } finally {
+        $script:bleUiBusy = $false
         Update-BleSessionUi
     }
 }
 
 function New-P50BleRunPaths($label) {
-    $baseDir = Get-BaseDir
-    $runRoot = Join-Path $baseDir "p50_ble_runs"
+    $localData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if (-not $localData) { $localData = Get-BaseDir }
+    $runRoot = Join-Path (Join-Path $localData "P50PrintAssistant") "runs"
     if (-not (Test-Path -LiteralPath $runRoot)) { New-Item -ItemType Directory -Path $runRoot | Out-Null }
-    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
     $sizeText = "{0:g}x{1:g}mm" -f $label.Width, $label.Height
     $prefix = "ble_{0}_{1}" -f $stamp, $sizeText
     return [pscustomobject]@{
@@ -1302,6 +1322,27 @@ function New-P50BleRunPaths($label) {
         ImagePath = Join-Path $runRoot "$prefix.png"
         JobPath = Join-Path $runRoot "$prefix.job.bin"
         LogPath = Join-Path $runRoot "$prefix.log.txt"
+    }
+}
+
+function Remove-OldP50BleRuns([string]$runRoot, [int]$keep = 10) {
+    if (-not (Test-Path -LiteralPath $runRoot)) { return }
+    $files = @(Get-ChildItem -LiteralPath $runRoot -Filter "ble_*" -File)
+    $latestByPrefix = @{}
+    foreach ($file in $files) {
+        $separator = $file.Name.IndexOf(".", [StringComparison]::Ordinal)
+        if ($separator -le 0) { continue }
+        $prefix = $file.Name.Substring(0, $separator)
+        if (-not $latestByPrefix.ContainsKey($prefix) -or $file.LastWriteTimeUtc -gt $latestByPrefix[$prefix]) {
+            $latestByPrefix[$prefix] = $file.LastWriteTimeUtc
+        }
+    }
+    $oldPrefixes = @($latestByPrefix.GetEnumerator() | Sort-Object Value -Descending | Select-Object -Skip $keep)
+    foreach ($entry in $oldPrefixes) {
+        $prefixWithDot = "$($entry.Key)."
+        Get-ChildItem -LiteralPath $runRoot -File |
+            Where-Object { $_.Name.StartsWith($prefixWithDot, [StringComparison]::OrdinalIgnoreCase) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1320,9 +1361,11 @@ function Save-P50BleRunLog($paths, $result) {
         $result.StdErr
     )
     $lines | Out-File -LiteralPath $paths.LogPath -Encoding UTF8
+    Remove-OldP50BleRuns $paths.Directory 10
 }
 
 function Print-CurrentLabelBle {
+    if ($script:bleUiBusy) { return }
     try { $label = Require-SelectedLabelSize } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "P50 打印助手") | Out-Null
         Update-BleSessionUi
@@ -1340,7 +1383,9 @@ function Print-CurrentLabelBle {
     $copies = [int]$script:copiesBox.Value
     $runPaths = New-P50BleRunPaths $label
     $bitmap = $null
-    $script:blePrintButton.Enabled = $false
+    $payload = $null
+    $script:bleUiBusy = $true
+    Update-BleSessionUi
     $script:statusLabel.Text = "正在生成 $($label.Width) x $($label.Height) mm 蓝牙打印点阵..."
     [System.Windows.Forms.Application]::DoEvents()
     try {
@@ -1355,7 +1400,7 @@ function Print-CurrentLabelBle {
             copies = $copies
             density = (Get-BlePrintDensity)
             chunkDelay = 0.03
-            postJobDelay = 0.05
+            postJobDelay = 0.0
             zlibWbits = 10
             xOffsetMm = 0.0
             yOffsetMm = 0.0
@@ -1363,32 +1408,56 @@ function Print-CurrentLabelBle {
             sendStatusQuery = $true
             sendMediaCommand = $false
             includeLocationBetweenPages = $true
-            jobCompleteTimeout = 8
+            jobCompleteTimeout = 50
             saveJob = $runPaths.JobPath
         }
-        $response = Invoke-P50BleSessionCommand $payload 90000
+        $printTimeoutMs = [Math]::Max(90000, 30000 + ($copies * 60000))
+        $response = Invoke-P50BleSessionCommand $payload $printTimeoutMs
         $stdout = if ($response.logs) { ($response.logs -join "`r`n") } else { "" }
         $result = [pscustomobject]@{ ExitCode = 0; StdOut = $stdout; StdErr = ""; FileName = "p50_ble_session.py"; Arguments = ($payload | ConvertTo-Json -Compress -Depth 8) }
         Save-P50BleRunLog $runPaths $result
         $state.LastBleImagePath = $runPaths.ImagePath
         $state.LastBleLogPath = $runPaths.LogPath
-        $script:statusLabel.Text = "蓝牙打印已发送：$($label.Width) x $($label.Height) mm，$copies 份，已等待打印机确认。日志：$($runPaths.LogPath)"
+        $script:statusLabel.Text = "蓝牙打印完成：$($label.Width) x $($label.Height) mm，$copies 份均已收到打印机确认。"
     } catch {
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "蓝牙打印失败") | Out-Null
-        try {
-            $statusResponse = Invoke-P50BleSessionCommand @{ cmd = "status" } 5000
-            $script:bleSessionConnected = [bool]$statusResponse.result.connected
-        } catch {
+        $errorMessage = $_.Exception.Message
+        $failedResponse = $script:lastBleSessionResponse
+        $failureLogs = if ($null -ne $failedResponse -and $failedResponse.logs) { ($failedResponse.logs -join "`r`n") } else { "" }
+        $failureTrace = if ($null -ne $failedResponse -and $failedResponse.traceback) { [string]$failedResponse.traceback } else { "" }
+        $payloadText = if ($null -ne $payload) { $payload | ConvertTo-Json -Compress -Depth 8 } else { "" }
+        $failureResult = [pscustomobject]@{
+            ExitCode = 1
+            StdOut = $failureLogs
+            StdErr = (($errorMessage, $failureTrace | Where-Object { $_ }) -join "`r`n`r`n")
+            FileName = "p50_ble_session.py"
+            Arguments = $payloadText
+        }
+        Save-P50BleRunLog $runPaths $failureResult
+        $state.LastBleImagePath = $runPaths.ImagePath
+        $state.LastBleLogPath = $runPaths.LogPath
+        if (Test-P50BleSessionProcessAlive) {
+            try {
+                $statusResponse = Invoke-P50BleSessionCommand @{ cmd = "status" } 5000
+                $script:bleSessionConnected = [bool]$statusResponse.result.connected
+            } catch {
+                $script:bleSessionConnected = $false
+            }
+        } else {
             $script:bleSessionConnected = $false
         }
-        $script:statusLabel.Text = "蓝牙打印失败。日志：$($runPaths.LogPath)"
+        [System.Windows.Forms.MessageBox]::Show("$errorMessage`r`n`r`n诊断日志：$($runPaths.LogPath)", "蓝牙打印失败") | Out-Null
+        $script:statusLabel.Text = "蓝牙打印失败，已保存诊断日志。"
     } finally {
         if ($null -ne $bitmap) { $bitmap.Dispose() }
+        $script:bleUiBusy = $false
         Update-BleSessionUi
     }
 }
 
 function Disconnect-P50BleSession {
+    if ($script:bleUiBusy) { return }
+    $script:bleUiBusy = $true
+    Update-BleSessionUi
     try {
         Stop-P50BleSessionHelper
         $script:statusLabel.Text = "蓝牙已断开。"
@@ -1396,6 +1465,7 @@ function Disconnect-P50BleSession {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "蓝牙断开失败") | Out-Null
         $script:statusLabel.Text = "蓝牙断开失败。"
     } finally {
+        $script:bleUiBusy = $false
         Update-BleSessionUi
     }
 }
@@ -1795,6 +1865,60 @@ Update-Preview
 Update-BleSessionUi
 Update-ImportUi
 
+if ($BleIpcSelfTest) {
+    $helperPath = Join-Path (Get-BaseDir) "tests\fake_ble_session.py"
+    if (-not (Test-Path -LiteralPath $helperPath)) { throw "Missing BLE IPC test helper: $helperPath" }
+    $script:bleSessionScriptOverride = $helperPath
+    try {
+        $first = Invoke-P50BleSessionCommand @{ cmd = "echo"; value = "first" } 5000
+        if ($first.result.value -ne "first") { throw "BLE IPC self-test did not receive the first response." }
+
+        $helperErrorCaptured = $false
+        try {
+            [void](Invoke-P50BleSessionCommand @{ cmd = "error" } 5000)
+        } catch {
+            if ($_.Exception.Message -ne "expected helper failure") { throw }
+            $helperErrorCaptured = $true
+        }
+        if (-not $helperErrorCaptured -or $script:lastBleSessionResponse.traceback -ne "expected traceback") {
+            throw "BLE IPC self-test did not preserve structured helper diagnostics."
+        }
+
+        $timedOut = $false
+        try {
+            [void](Invoke-P50BleSessionCommand @{ cmd = "delay"; seconds = 0.3 } 80)
+        } catch {
+            if ($_.Exception.Message -notmatch "超时") { throw }
+            $timedOut = $true
+        }
+        if (-not $timedOut) { throw "BLE IPC self-test expected the delayed request to time out." }
+        if (Test-P50BleSessionProcessAlive) { throw "BLE IPC self-test expected the timed-out helper to be terminated." }
+
+        $second = Invoke-P50BleSessionCommand @{ cmd = "echo"; value = "second" } 5000
+        if ($second.result.value -ne "second") { throw "BLE IPC self-test could not recover after a timeout." }
+
+        $reentryBlocked = $false
+        $script:bleSessionCommandInProgress = $true
+        try {
+            [void](Invoke-P50BleSessionCommand @{ cmd = "echo"; value = "reentry" } 1000)
+        } catch {
+            if ($_.Exception.Message -notmatch "另一项操作") { throw }
+            $reentryBlocked = $true
+        } finally {
+            $script:bleSessionCommandInProgress = $false
+        }
+        if (-not $reentryBlocked) { throw "BLE IPC self-test expected a concurrent command to be rejected." }
+
+        Write-Output "BLE IPC self-test OK: timeout recovery and reentry guard verified"
+    } finally {
+        Stop-P50BleSessionHelper
+        $script:bleSessionScriptOverride = ""
+        if ($null -ne $state.Image) { $state.Image.Dispose() }
+        $form.Dispose()
+    }
+    exit 0
+}
+
 if ($ProbeClipboard) {
     Select-LabelSizeByName $ProbeLabelSize
     $sizeTag = ($script:sizeCombo.SelectedItem.ToString() -replace '[^0-9]+', 'x').Trim('x')
@@ -1850,6 +1974,7 @@ if ($SelfTest) {
     $bleRuntimeSummary = Get-BleRuntimeSummary
     $syntheticImage = $null
     $dotBitmap = $null
+    $retentionDir = $null
     try {
         $uiText = New-Object System.Collections.Generic.List[string]
         function Add-ControlTextForSelfTest($control) {
@@ -1909,6 +2034,19 @@ if ($SelfTest) {
         $syntheticImage = New-SyntheticChemDrawImage
         Set-CurrentImage $syntheticImage "selftest synthetic ChemDraw-like image" $true
         $syntheticImage = $null
+        $script:bleSessionConnected = $true
+        Update-BleSessionUi
+        if (-not $script:blePrintButton.Enabled) {
+            throw "UI self-test expected Bluetooth print to become enabled after connection, label selection, and image import."
+        }
+        $script:bleUiBusy = $true
+        Update-BleSessionUi
+        if ($script:bleScanButton.Enabled -or $script:bleConnectButton.Enabled -or $script:bleDisconnectButton.Enabled -or $script:blePrintButton.Enabled) {
+            throw "UI self-test expected all Bluetooth actions to be disabled while an operation is in progress."
+        }
+        $script:bleUiBusy = $false
+        $script:bleSessionConnected = $false
+        Update-BleSessionUi
         $autoThreshold = [int]$script:bleThresholdBox.Value
         if ($autoThreshold -lt 35 -or $autoThreshold -gt 245) { throw "Auto threshold self-test produced an out-of-range value: $autoThreshold" }
         if ($state.ThresholdManuallyAdjusted) { throw "Auto threshold self-test incorrectly marked the threshold as manually adjusted." }
@@ -1951,6 +2089,21 @@ if ($SelfTest) {
             throw "Image rotation self-test expected 90 degree rotation to swap dimensions; got $($rotatedImage.Width) x $($rotatedImage.Height)."
         }
         Write-Output "Image rotation self-test OK"
+
+        $retentionDir = Join-Path ([System.IO.Path]::GetTempPath()) ("p50-run-retention-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $retentionDir | Out-Null
+        for ($index = 1; $index -le 12; $index++) {
+            $prefix = "ble_20260710_1200{0:D2}_000_30x15mm" -f $index
+            [System.IO.File]::WriteAllText((Join-Path $retentionDir "$prefix.log.txt"), "test")
+            [System.IO.File]::WriteAllText((Join-Path $retentionDir "$prefix.png"), "test")
+            (Get-Item -LiteralPath (Join-Path $retentionDir "$prefix.log.txt")).LastWriteTimeUtc = [DateTime]::UtcNow.AddSeconds($index)
+        }
+        Remove-OldP50BleRuns $retentionDir 10
+        if (@(Get-ChildItem -LiteralPath $retentionDir -Filter "*.log.txt" -File).Count -ne 10 -or
+            @(Get-ChildItem -LiteralPath $retentionDir -Filter "*.png" -File).Count -ne 10) {
+            throw "Run retention self-test expected exactly 10 run groups."
+        }
+        Write-Output "Run retention self-test OK"
     } finally {
         if ($null -ne $syntheticImage) { $syntheticImage.Dispose() }
         if ($null -ne $dotBitmap) { $dotBitmap.Dispose() }
@@ -1959,6 +2112,10 @@ if ($SelfTest) {
         if ($null -ne $coverBitmap) { $coverBitmap.Dispose() }
         if ($null -ne $rotationImage) { $rotationImage.Dispose() }
         if ($null -ne $rotatedImage) { $rotatedImage.Dispose() }
+        if ($retentionDir -and (Test-Path -LiteralPath $retentionDir)) {
+            Get-ChildItem -LiteralPath $retentionDir -File | Remove-Item -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $retentionDir -Force -ErrorAction SilentlyContinue
+        }
     }
     Write-Output $bleRuntimeSummary
     Write-Output "SelfTest OK"

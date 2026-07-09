@@ -33,6 +33,39 @@ Android writes print data in 97-byte BLE chunks. On the LuckP channel, the
 printer returns `01 01` credits and final job completion as `4F 4B 0D 0A`
 (`OK\r\n`). Some Windows tests also observed `AA 0D 0A` as a completion marker.
 
+## Credit flow control
+
+The installed Android app selects its older credit-flow branch for the tested
+`P50S_*` device. APK disassembly and the Android BLE captures agree on this
+state machine:
+
+1. The connection starts with zero local credits.
+2. Control notification `01 04` initializes the window to four credits.
+3. Each successfully written BLE chunk consumes one credit.
+4. A two-byte control notification `01 n` adds `n` credits. Additions are not
+   capped at four; delayed notifications can temporarily raise the value above
+   four.
+5. If the window remains empty for one second, the old-flow branch grants one
+   recovery credit and retries one chunk.
+6. Final job notification `4F 4B 0D 0A` resets the window to four.
+
+After connection initialization, the helper does not reset credits at the
+beginning of an arbitrary GUI print request. It waits for the printer's control
+notifications; the per-job reset happens only on a confirmed final job
+notification. If final confirmation times out, remaining copies are not sent
+and the BLE connection is closed so stale transport state cannot affect the
+next print.
+
+The Android `DeviceManager.p50Print(...)` path calls `getSendResult(50000)` for
+each page, so the default completion timeout is 50 seconds. The Windows GUI's
+overall helper timeout scales with the requested copy count and does not impose
+a shorter fixed limit across the whole batch.
+
+The persistent helper also retains the `BLEDevice` object returned by the most
+recent scan. Connect uses that cached object first, avoiding a redundant second
+discovery pass; address-based connection and short discovery remain fallbacks
+for stale scan results.
+
 ## CommandPort compressed bitmap
 
 P50/P50S printing uses the CommandPort compressed image command, not a Windows

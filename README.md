@@ -80,6 +80,25 @@ python -m pip install -r requirements.txt
 powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\P50_Print_Assistant.ps1
 ```
 
+运行测试或构建发布版时安装开发依赖：
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+python -m mypy src tests
+powershell -NoProfile -ExecutionPolicy Bypass -File .\P50_Print_Assistant.ps1 -SelfTest
+powershell -NoProfile -ExecutionPolicy Bypass -File .\P50_Print_Assistant.ps1 -BleIpcSelfTest
+```
+
+构建经过自测的便携发布包：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_release.ps1 -Version 0.1.3
+```
+
+蓝牙打印的最近 10 次预览、任务字节和诊断日志保存在
+`%LOCALAPPDATA%\P50PrintAssistant\runs`。
+
 ## 适配范围
 
 当前主要面向凝优 P50S 热敏标签打印机，标签宽度按 8 点/mm 渲染。

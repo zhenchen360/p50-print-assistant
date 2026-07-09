@@ -15,7 +15,7 @@ import os
 import time
 import zlib
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 from bleak import BleakClient, BleakScanner
 from PIL import Image, ImageDraw, ImageFont
@@ -24,11 +24,8 @@ from PIL import Image, ImageDraw, ImageFont
 P50_NAME_HINTS = (
     "P50",
     "P50S",
-    "S8",
-    "YQ",
     "YXQ",
     "FEIOOU",
-    "DELI",
     "MARKLIFE",
     "LUCKP",
 )
@@ -55,6 +52,41 @@ DOTS_PER_MM = 8
 # split as 97/97/97/82 bytes with a 30 ms timer and 01 01 credit notifications.
 BLE_CHUNK_SIZE = 97
 BLE_CHUNK_DELAY = 0.03
+APP_INITIAL_CREDITS = 4
+APP_CREDIT_RECOVERY_SECONDS = 1.0
+
+
+def _apply_p50_credit_notification(
+    data: bytes,
+    credit_state: dict[str, int],
+    credit_event: asyncio.Event,
+    log: Callable[[str], None],
+) -> bool:
+    if len(data) != 2 or data[0] != 0x01:
+        return False
+    granted = data[1]
+    if granted == APP_INITIAL_CREDITS:
+        credit_state["credits"] = APP_INITIAL_CREDITS
+        log(f"CREDIT initialized -> {APP_INITIAL_CREDITS}")
+    else:
+        credit_state["credits"] += granted
+        log(f"CREDIT +{granted} -> {credit_state['credits']}")
+    credit_event.set()
+    return True
+
+
+def _reset_p50_credit_after_ok(
+    credit_state: dict[str, int],
+    credit_event: asyncio.Event,
+    log: Callable[[str], None],
+) -> None:
+    credit_state["credits"] = APP_INITIAL_CREDITS
+    credit_event.set()
+    log(f"CREDIT reset after job OK -> {APP_INITIAL_CREDITS}")
+
+
+def _notification_source(sender: Any) -> str:
+    return str(getattr(sender, "uuid", sender)).lower()
 
 
 def _load_font(size: int, bold: bool = False):
@@ -143,9 +175,11 @@ async def _find_device(address: str | None, name: str | None, timeout: float):
     return best
 
 
-async def scan(timeout: float, show_all: bool, output_json: bool) -> int:
-    if not output_json:
-        print(f"Scanning BLE advertisements for {timeout:g}s...")
+async def discover_devices(
+    timeout: float,
+    show_all: bool = False,
+    device_cache: dict[str, Any] | None = None,
+) -> list[ScanRow]:
     seen = await BleakScanner.discover(timeout=timeout, return_adv=True)
     rows: list[ScanRow] = []
 
@@ -160,10 +194,19 @@ async def scan(timeout: float, show_all: bool, output_json: bool) -> int:
         services_list = list(getattr(adv, "service_uuids", None) or [])
         services = ",".join(services_list)
         matched = _matches_printer(name, services_list)
-        if show_all or matched or name:
+        if show_all or matched:
             rows.append(ScanRow(name or "(no name)", address, rssi, services, matched))
+            if device_cache is not None and address:
+                device_cache[address.upper()] = device
 
     rows.sort(key=lambda row: (not row.matched, row.name.upper(), row.address))
+    return rows
+
+
+async def scan(timeout: float, show_all: bool, output_json: bool) -> int:
+    if not output_json:
+        print(f"Scanning BLE advertisements for {timeout:g}s...")
+    rows = await discover_devices(timeout, show_all)
     if output_json:
         print(json.dumps([row.__dict__ for row in rows], ensure_ascii=False, indent=2))
         return 0 if rows else 1
@@ -211,6 +254,8 @@ async def services(address: str | None, name: str | None, timeout: float, pair: 
         services_obj = getattr(client, "services", None)
         if services_obj is None and hasattr(client, "get_services"):
             services_obj = await client.get_services()
+        if services_obj is None:
+            raise RuntimeError("Connected device did not expose a GATT service collection.")
 
         print()
         for service in services_obj:
@@ -349,7 +394,7 @@ def _image_to_raster(image: Image.Image, threshold: int) -> tuple[bytes, int, in
     width, height = gray.size
     width_bytes = (width + 7) // 8
     raster = bytearray(width_bytes * height)
-    pixels = gray.load()
+    pixels: Any = gray.load()
     for y in range(height):
         row_offset = y * width_bytes
         for x in range(width):
@@ -466,7 +511,6 @@ def _build_p50_commandport_job(
     density: int,
     page_index: int,
     total_pages: int,
-    print_num: int,
     zlib_wbits: int,
     include_location_between_pages: bool,
     threshold: int = 126,
@@ -496,10 +540,12 @@ async def _write_chunks(
     flow_control: str = "none",
     credit_state: dict[str, int] | None = None,
     credit_event: asyncio.Event | None = None,
-    credit_timeout: float = 5.0,
+    credit_timeout: float = APP_CREDIT_RECOVERY_SECONDS,
 ) -> None:
     if chunk_size < 1:
         raise ValueError("chunk_size must be >= 1")
+    if flow_control == "credit" and credit_timeout <= 0:
+        raise ValueError("credit recovery interval must be greater than zero")
     if flow_control == "credit" and (credit_state is None or credit_event is None):
         raise ValueError("credit flow control needs credit_state and credit_event")
     total = (len(payload) + chunk_size - 1) // chunk_size
@@ -513,11 +559,19 @@ async def _write_chunks(
                 credit_event.clear()
                 try:
                     await asyncio.wait_for(credit_event.wait(), timeout=credit_timeout)
-                except asyncio.TimeoutError as exc:
-                    raise TimeoutError(f"Timed out waiting for BLE credit before chunk {index}/{total}") from exc
-            credit_state["credits"] -= 1
-            print(f"CREDIT use -> {credit_state['credits']}")
+                except asyncio.TimeoutError:
+                    if credit_state["credits"] <= 0:
+                        credit_state["credits"] = 1
+                        credit_event.set()
+                        print("CREDIT recovery after wait -> 1")
         await client.write_gatt_char(write_uuid, chunk, response=write_response)
+        if flow_control == "credit":
+            assert credit_state is not None
+            assert credit_event is not None
+            credit_state["credits"] -= 1
+            if credit_state["credits"] <= 0:
+                credit_event.clear()
+            print(f"CREDIT use -> {credit_state['credits']}")
         await asyncio.sleep(delay)
 
 
@@ -565,6 +619,8 @@ async def print_image(
         raise SystemExit("print-test needs --address or --name")
     if copies < 1:
         raise SystemExit("--copies must be >= 1")
+    if initial_credits < 0:
+        raise SystemExit("--initial-credits must be >= 0")
     if threshold < 1 or threshold > 254:
         raise SystemExit("--threshold must be between 1 and 254")
 
@@ -583,7 +639,7 @@ async def print_image(
     elif channel == "luckp":
         notify_uuid = APK_LUCKP_NOTIFY
         write_uuid = APK_LUCKP_WRITE
-        notify_uuids = [APK_LUCKP_NOTIFY, APK_LUCKP_CONTROL, APK_LUCKP_WRITE]
+        notify_uuids = [APK_LUCKP_NOTIFY, APK_LUCKP_CONTROL]
     else:
         raise SystemExit(f"Unknown channel: {channel}")
 
@@ -598,7 +654,8 @@ async def print_image(
 
     generated_test_label = not image_path
     if image_path:
-        image = Image.open(image_path).convert("L")
+        with Image.open(image_path) as source_image:
+            image = source_image.convert("L")
         width_mm_text = f"{image.width / DOTS_PER_MM:g}"
         height_mm_text = f"{image.height / DOTS_PER_MM:g}"
     else:
@@ -631,7 +688,6 @@ async def print_image(
             density=density,
             page_index=0,
             total_pages=1,
-            print_num=1,
             zlib_wbits=zlib_wbits,
             include_location_between_pages=p50_location_between_pages,
             threshold=threshold,
@@ -671,7 +727,6 @@ async def print_image(
                 density=density,
                 page_index=copy_index,
                 total_pages=copies,
-                print_num=copies,
                 zlib_wbits=zlib_wbits,
                 include_location_between_pages=p50_location_between_pages,
                 threshold=threshold,
@@ -710,6 +765,7 @@ async def print_image(
     credit_state = {"credits": initial_credits}
     credit_event = asyncio.Event()
     job_complete_event = asyncio.Event()
+    notification_tails: dict[str, bytearray] = {}
     if initial_credits > 0:
         credit_event.set()
 
@@ -717,13 +773,23 @@ async def print_image(
         data_bytes = bytes(data)
         received.append(data_bytes)
         print(f"NOTIFY {sender}: {data_bytes.hex(' ').upper()}")
-        if flow_control == "credit" and data_bytes == credit_magic:
-            credit_state["credits"] += 1
-            print(f"CREDIT +1 -> {credit_state['credits']}")
-            credit_event.set()
-        if any(data_bytes == marker for marker in complete_markers):
+        source = _notification_source(sender)
+        if flow_control == "credit" and APK_LUCKP_CONTROL in source:
+            matched_credit = _apply_p50_credit_notification(data_bytes, credit_state, credit_event, print)
+            if not matched_credit and data_bytes == credit_magic:
+                credit_state["credits"] += 1
+                credit_event.set()
+                print(f"CREDIT +1 -> {credit_state['credits']}")
+        tail = notification_tails.setdefault(source, bytearray())
+        tail.extend(data_bytes)
+        if len(tail) > 128:
+            del tail[:-128]
+        if any(marker in tail for marker in complete_markers):
             print("JOB COMPLETE notify matched.")
+            if flow_control == "credit":
+                _reset_p50_credit_after_ok(credit_state, credit_event, print)
             job_complete_event.set()
+            tail.clear()
 
     print(f"Connecting to {device.name or '(no name)'} [{device.address}]...")
     async with BleakClient(device, timeout=timeout, pair=pair) as client:
@@ -736,6 +802,12 @@ async def print_image(
                 print(f"NOTIFY ON: {candidate_uuid}")
             except Exception as exc:
                 print(f"Notify start failed for {candidate_uuid}, continuing: {exc}")
+        required_notifications = {notify_uuid}
+        if channel == "luckp":
+            required_notifications.add(APK_LUCKP_CONTROL)
+        if not required_notifications.issubset(set(subscribed)):
+            missing = ", ".join(sorted(required_notifications.difference(subscribed)))
+            raise RuntimeError(f"Required BLE notifications were unavailable: {missing}")
 
         if send_media_command:
             media_command = bytes([0x1F, 0x80, 0x01, paper_map[paper_type]])
@@ -791,6 +863,7 @@ async def print_image(
 
         for copy_index in range(copies):
             job_complete_event.clear()
+            notification_tails.clear()
             job = planned_jobs[copy_index]
             print(f"WRITE JOB {copy_index + 1}/{copies}: {len(job)} bytes")
             await _write_chunks(
@@ -810,8 +883,11 @@ async def print_image(
                 print(f"WAIT JOB COMPLETE {copy_index + 1}/{copies}: {marker_text}, timeout {job_complete_timeout:g}s")
                 try:
                     await asyncio.wait_for(job_complete_event.wait(), timeout=job_complete_timeout)
-                except asyncio.TimeoutError:
-                    print(f"WARNING: no job-complete notification after {job_complete_timeout:g}s; continuing.")
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(
+                        f"Printer did not confirm label {copy_index + 1}/{copies} within "
+                        f"{job_complete_timeout:g}s; remaining labels were not sent."
+                    ) from exc
             await asyncio.sleep(post_job_delay)
 
         await asyncio.sleep(2.0)
@@ -947,9 +1023,14 @@ def main() -> int:
     print_test_parser.add_argument("--post-job-delay", type=float, default=0.8)
     print_test_parser.add_argument("--write-response", action="store_true")
     print_test_parser.add_argument("--flow-control", choices=("none", "credit"), default="credit")
-    print_test_parser.add_argument("--initial-credits", type=int, default=4)
+    print_test_parser.add_argument("--initial-credits", type=int, default=0)
     print_test_parser.add_argument("--credit-notify", default="0101")
-    print_test_parser.add_argument("--credit-timeout", type=float, default=5.0)
+    print_test_parser.add_argument(
+        "--credit-timeout",
+        type=float,
+        default=APP_CREDIT_RECOVERY_SECONDS,
+        help="Seconds without credit before the app-compatible one-packet recovery.",
+    )
     print_test_parser.add_argument("--tail-feed-dots", type=int, default=70)
     print_test_parser.add_argument(
         "--tail-mode",
@@ -977,7 +1058,7 @@ def main() -> int:
     print_test_parser.add_argument("--threshold", type=int, default=126, help="Black/white threshold, 1-254. Android CommandPort default is 126.")
     print_test_parser.add_argument("--no-wait-job-complete", action="store_true", help="Do not wait for the printer final OK before the next copy.")
     print_test_parser.add_argument("--job-complete-notify", default="AA0D0A,4F4B0D0A", help="Comma-separated final notification bytes.")
-    print_test_parser.add_argument("--job-complete-timeout", type=float, default=8.0)
+    print_test_parser.add_argument("--job-complete-timeout", type=float, default=50.0)
     print_image_parser = sub.add_parser("print-image", help="Print an existing 8 dots/mm label PNG over BLE.")
     print_image_parser.add_argument("--address", help="BLE address from scan output.")
     print_image_parser.add_argument("--name", help="Substring of device name, for example P50S_xxxx_BLE.")
@@ -995,9 +1076,14 @@ def main() -> int:
     print_image_parser.add_argument("--post-job-delay", type=float, default=0.8)
     print_image_parser.add_argument("--write-response", action="store_true")
     print_image_parser.add_argument("--flow-control", choices=("none", "credit"), default="credit")
-    print_image_parser.add_argument("--initial-credits", type=int, default=4)
+    print_image_parser.add_argument("--initial-credits", type=int, default=0)
     print_image_parser.add_argument("--credit-notify", default="0101")
-    print_image_parser.add_argument("--credit-timeout", type=float, default=5.0)
+    print_image_parser.add_argument(
+        "--credit-timeout",
+        type=float,
+        default=APP_CREDIT_RECOVERY_SECONDS,
+        help="Seconds without credit before the app-compatible one-packet recovery.",
+    )
     print_image_parser.add_argument("--tail-feed-dots", type=int, default=70)
     print_image_parser.add_argument(
         "--tail-mode",
@@ -1020,7 +1106,7 @@ def main() -> int:
     print_image_parser.add_argument("--threshold", type=int, default=126, help="Black/white threshold, 1-254. Android CommandPort default is 126.")
     print_image_parser.add_argument("--no-wait-job-complete", action="store_true", help="Do not wait for the printer final OK before the next copy.")
     print_image_parser.add_argument("--job-complete-notify", default="AA0D0A,4F4B0D0A", help="Comma-separated final notification bytes.")
-    print_image_parser.add_argument("--job-complete-timeout", type=float, default=8.0)
+    print_image_parser.add_argument("--job-complete-timeout", type=float, default=50.0)
     args = parser.parse_args()
 
     if args.cmd == "scan":

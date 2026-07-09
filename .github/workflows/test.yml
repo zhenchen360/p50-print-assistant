@@ -1,0 +1,30 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Python tests
+        run: python -m unittest discover -s tests -v
+      - name: Python type check
+        run: python -m mypy src tests
+      - name: GUI and rendering self-test
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\P50_Print_Assistant.ps1 -SelfTest
+      - name: BLE helper IPC self-test
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\P50_Print_Assistant.ps1 -BleIpcSelfTest
+      - name: Portable package smoke test
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_release.ps1 -Version 0.0.0 -SkipTests -SkipPipInstall
