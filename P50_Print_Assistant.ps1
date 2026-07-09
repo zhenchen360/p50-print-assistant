@@ -602,16 +602,37 @@ function Get-ContentRectMm($label, [double]$marginMm) {
     return New-Object System.Drawing.RectangleF($x, $y, $w, $h)
 }
 
-function Get-DestinationRectMm($label, [double]$marginMm, [bool]$preserveAspect, [bool]$cropToFill) {
+function Get-ImageRotationDegrees {
+    if ($null -eq $script:rotationCombo -or $null -eq $script:rotationCombo.SelectedItem) { return 0 }
+    switch ($script:rotationCombo.SelectedIndex) {
+        1 { return 90 }
+        2 { return 180 }
+        3 { return 270 }
+        default { return 0 }
+    }
+}
+
+function Copy-RotatedImage([System.Drawing.Image]$image, [int]$degrees) {
+    if ($null -eq $image) { return $null }
+    $copy = $image.Clone()
+    switch ($degrees) {
+        90 { $copy.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipNone) }
+        180 { $copy.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipNone) }
+        270 { $copy.RotateFlip([System.Drawing.RotateFlipType]::Rotate270FlipNone) }
+    }
+    return $copy
+}
+
+function Get-DestinationRectMm($label, [double]$marginMm, [bool]$preserveAspect, [bool]$cropToFill, [System.Drawing.Image]$sourceImage) {
     $box = Get-ContentRectMm $label $marginMm
     $x = $box.X
     $y = $box.Y
     $w = $box.Width
     $h = $box.Height
-    if (-not $preserveAspect -or $null -eq $state.Image) {
+    if (-not $preserveAspect -or $null -eq $sourceImage) {
         return New-Object System.Drawing.RectangleF($x, $y, $w, $h)
     }
-    $srcAspect = [double]$state.Image.Width / [double]$state.Image.Height
+    $srcAspect = [double]$sourceImage.Width / [double]$sourceImage.Height
     $boxAspect = [double]$w / [double]$h
     if (($cropToFill -and $srcAspect -gt $boxAspect) -or ((-not $cropToFill) -and $srcAspect -le $boxAspect)) {
         $drawH = $h
@@ -694,6 +715,7 @@ function New-P50GrayDotBitmap {
     $bitmap = New-Object System.Drawing.Bitmap($bitmapWidth, $bitmapHeight, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
     $graphics = [System.Drawing.Graphics]::FromImage($renderBitmap)
     $downsampleGraphics = $null
+    $renderImage = $null
     try {
         $graphics.Clear([System.Drawing.Color]::White)
         $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
@@ -703,8 +725,9 @@ function New-P50GrayDotBitmap {
         $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::SingleBitPerPixelGridFit
         $marginMm = Get-MarginMm
         $cropToFill = ($null -ne $script:cropFillCheck -and $script:cropFillCheck.Checked)
+        $renderImage = Copy-RotatedImage $state.Image (Get-ImageRotationDegrees)
         $contentMm = Get-ContentRectMm $label $marginMm
-        $destMm = Get-DestinationRectMm $label $marginMm $script:aspectCheck.Checked $cropToFill
+        $destMm = Get-DestinationRectMm $label $marginMm $script:aspectCheck.Checked $cropToFill $renderImage
         $offsetMm = Get-BleImageOffsetMm
         $contentPx = New-Object System.Drawing.RectangleF(
             [single]($contentMm.X * $renderPxPerMm),
@@ -718,9 +741,9 @@ function New-P50GrayDotBitmap {
             [single]($destMm.Width * $renderPxPerMm),
             [single]($destMm.Height * $renderPxPerMm)
         )
-        if ($null -ne $state.Image) {
+        if ($null -ne $renderImage) {
             if ($cropToFill) { $graphics.SetClip($contentPx) }
-            try { $graphics.DrawImage($state.Image, $destPx) } finally { if ($cropToFill) { $graphics.ResetClip() } }
+            try { $graphics.DrawImage($renderImage, $destPx) } finally { if ($cropToFill) { $graphics.ResetClip() } }
         }
         $graphics.Dispose(); $graphics = $null
         $downsampleGraphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -730,6 +753,7 @@ function New-P50GrayDotBitmap {
     } finally {
         if ($null -ne $graphics) { $graphics.Dispose() }
         if ($null -ne $downsampleGraphics) { $downsampleGraphics.Dispose() }
+        if ($null -ne $renderImage) { $renderImage.Dispose() }
         $renderBitmap.Dispose()
     }
     return $bitmap
@@ -1601,7 +1625,17 @@ $script:sizeCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
 [void]$script:sizeCombo.Items.Add("40 x 20 mm")
 [void]$script:sizeCombo.Items.Add("40 x 30 mm")
 $script:sizeCombo.SelectedIndex = -1
-Add-Control $importSection (New-FieldBlock "标签尺寸" $script:sizeCombo) 54
+$script:rotationCombo = New-Object System.Windows.Forms.ComboBox
+$script:rotationCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+[void]$script:rotationCombo.Items.Add("不旋转")
+[void]$script:rotationCombo.Items.Add("顺时针 90 度")
+[void]$script:rotationCombo.Items.Add("顺时针 180 度")
+[void]$script:rotationCombo.Items.Add("顺时针 270 度")
+$script:rotationCombo.SelectedIndex = 0
+$labelImageRow = New-EqualRow 2
+Add-RowItem $labelImageRow (New-FieldBlock "标签尺寸" $script:sizeCombo) 0 6
+Add-RowItem $labelImageRow (New-FieldBlock "图片旋转" $script:rotationCombo) 1 0
+Add-Control $importSection $labelImageRow 54
 $script:pasteButton = New-Object System.Windows.Forms.Button
 $script:pasteButton.Text = "从剪贴板粘贴"
 Set-PrimaryButton $script:pasteButton ([System.Drawing.Color]::FromArgb(19, 121, 95))
@@ -1677,6 +1711,7 @@ Add-RowItem $diagnosticButtonRow $savePreviewButton 1 0
 Add-Control $diagnosticSection $diagnosticButtonRow 36
 
 $script:sizeCombo.Add_SelectedIndexChanged({ Set-AutoThresholdFromCurrentImage; Update-Preview; Update-BleSessionUi; Update-ImportUi })
+$script:rotationCombo.Add_SelectedIndexChanged({ Set-AutoThresholdFromCurrentImage; Update-Preview })
 $script:marginSlider.Add_ValueChanged({ Update-MarginLabel; Update-Preview })
 $script:aspectCheck.Add_CheckedChanged({ Update-Preview })
 $script:cropFillCheck.Add_CheckedChanged({ Update-Preview })
@@ -1826,7 +1861,7 @@ if ($SelfTest) {
         $requiredTexts = @(
             "1. 设备连接", "2. 标签与图片", "3. 打印微调", "4. 打印",
             "扫描 P50 蓝牙", "连接蓝牙", "断开蓝牙", "从剪贴板粘贴",
-            "打开图片文件", "标签尺寸", "打印份数", "蓝牙打印",
+            "打开图片文件", "标签尺寸", "图片旋转", "打印份数", "蓝牙打印",
             "打印浓淡（仅蓝牙）", "线条阈值", "5. USB 备用与诊断"
         )
         foreach ($requiredText in $requiredTexts) {
@@ -1854,6 +1889,9 @@ if ($SelfTest) {
         }
         if ($script:cropFillCheck.Text -ne "裁切铺满" -or $script:cropFillCheck.Checked) {
             throw "UI self-test expected crop-fill to be available and disabled by default."
+        }
+        if ($script:rotationCombo.SelectedIndex -ne 0 -or $script:rotationCombo.Items.Count -ne 4) {
+            throw "UI self-test expected a four-position image rotation selector defaulting to no rotation."
         }
         $forbiddenTexts = @("2. 导入图片", "Connect, list, disconnect", "Disconnect BLE", "Print to P50 BLE", "Test Bluetooth services", "auto-connects", "USB continuous feed mode", "USB driver gap-label mode", "通过 Word 渲染粘贴", "Word 渲染", "从 ChemDraw 粘贴", "打开上次预览", "打开上次日志")
         foreach ($forbiddenText in $forbiddenTexts) {
@@ -1905,12 +1943,22 @@ if ($SelfTest) {
         if ($containEdgePixel.R -lt 128) { throw "Crop-fill self-test expected contain mode to preserve side whitespace." }
         if ($coverEdgePixel.R -ge 128) { throw "Crop-fill self-test expected fill mode to crop and cover the content area." }
         Write-Output "Crop-fill self-test OK"
+
+        $rotationImage = New-Object System.Drawing.Bitmap(10, 20, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $script:rotationCombo.SelectedIndex = 1
+        $rotatedImage = Copy-RotatedImage $rotationImage (Get-ImageRotationDegrees)
+        if ($rotatedImage.Width -ne 20 -or $rotatedImage.Height -ne 10) {
+            throw "Image rotation self-test expected 90 degree rotation to swap dimensions; got $($rotatedImage.Width) x $($rotatedImage.Height)."
+        }
+        Write-Output "Image rotation self-test OK"
     } finally {
         if ($null -ne $syntheticImage) { $syntheticImage.Dispose() }
         if ($null -ne $dotBitmap) { $dotBitmap.Dispose() }
         if ($null -ne $squareImage) { $squareImage.Dispose() }
         if ($null -ne $containBitmap) { $containBitmap.Dispose() }
         if ($null -ne $coverBitmap) { $coverBitmap.Dispose() }
+        if ($null -ne $rotationImage) { $rotationImage.Dispose() }
+        if ($null -ne $rotatedImage) { $rotatedImage.Dispose() }
     }
     Write-Output $bleRuntimeSummary
     Write-Output "SelfTest OK"
