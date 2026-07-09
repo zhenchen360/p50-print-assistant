@@ -637,11 +637,10 @@ function Print-CurrentLabel {
         return
     }
     $copies = [int]$script:copiesBox.Value
-    $marginMm = Get-MarginMm
-    $preserveAspect = [bool]$script:aspectCheck.Checked
     $printer = $script:printerCombo.Text.Trim()
     if (-not $printer) { $printer = $PrinterName }
     $doc = New-Object System.Drawing.Printing.PrintDocument
+    $printBitmap = $null
     $doc.DocumentName = "P50 {0}x{1}mm" -f $label.Width, $label.Height
     $doc.PrinterSettings.PrinterName = $printer
     if (-not $doc.PrinterSettings.IsValid) {
@@ -655,22 +654,39 @@ function Print-CurrentLabel {
     $doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
     $doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize(("P50 {0}x{1}mm" -f $label.Width, $label.Height), (ConvertTo-HundredthInch $label.Width), (ConvertTo-HundredthInch $label.Height))
     $doc.DefaultPageSettings.Landscape = $false
+    try {
+        $printBitmap = New-P50DotBitmap
+        $printBitmap.SetResolution(203.2, 203.2)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "生成 USB 打印点阵失败") | Out-Null
+        $doc.Dispose()
+        return
+    }
     $doc.add_PrintPage({
         param($sender, $eventArgs)
         $g = $eventArgs.Graphics
         $g.PageUnit = [System.Drawing.GraphicsUnit]::Millimeter
         $g.PageScale = 1.0
         $g.Clear([System.Drawing.Color]::White)
-        $dest = Get-DestinationRectMm $label $marginMm $preserveAspect
-        $g.DrawImage($state.Image, $dest)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
+        $hardMarginXmm = [single](($eventArgs.PageSettings.HardMarginX / 100.0) * 25.4)
+        $hardMarginYmm = [single](($eventArgs.PageSettings.HardMarginY / 100.0) * 25.4)
+        if ($hardMarginXmm -ne 0 -or $hardMarginYmm -ne 0) {
+            $g.TranslateTransform(-$hardMarginXmm, -$hardMarginYmm)
+        }
+        $dest = New-Object System.Drawing.Rectangle(0, 0, [int][Math]::Round($label.Width), [int][Math]::Round($label.Height))
+        $g.DrawImage($printBitmap, $dest, [single]0, [single]0, [single]$printBitmap.Width, [single]$printBitmap.Height, [System.Drawing.GraphicsUnit]::Pixel)
         $eventArgs.HasMorePages = $false
     })
     try {
         $doc.Print()
-        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动）。"
+        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，复用预览点阵）。"
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "打印失败") | Out-Null
     } finally {
+        if ($null -ne $printBitmap) { $printBitmap.Dispose() }
         $doc.Dispose()
     }
 }
