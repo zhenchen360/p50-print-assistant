@@ -40,6 +40,8 @@ Start_P50_Print_Assistant.vbs
 
 安装后，在系统打印机列表里选择 `P50 Printer` 之类的打印机名称即可使用 USB 备用打印。
 
+USB 驱动适配细节见 [USB Driver Notes](docs/usb-driver-notes.md)。
+
 ## 使用流程
 
 1. 扫描并连接凝优 P50S 蓝牙设备
