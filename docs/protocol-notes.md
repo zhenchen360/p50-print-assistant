@@ -12,9 +12,6 @@ open so the user flow matches the mobile app pattern:
 The raster resolution is treated as 8 dots/mm, matching 203 dpi thermal
 printing.
 
-This repository intentionally omits raw device captures, APK-derived artifacts,
-and per-device identifiers.
-
 ## BLE transport
 
 The current P50S path prefers the LuckP-style GATT channel when available,

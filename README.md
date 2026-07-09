@@ -32,6 +32,12 @@ Start_P50_Print_Assistant.vbs
 - 保持蓝牙连接，支持连续打印
 - 提供 Windows USB 备用打印入口
 
+## 蓝牙连接与打印
+
+程序采用“扫描、连接、打印、断开”的蓝牙工作流，连接后会复用当前会话，连续打印时等待打印机确认后再发送下一份。
+
+蓝牙协议和打印命令细节见 [Protocol Notes](docs/protocol-notes.md)。
+
 ## USB 备用与驱动
 
 使用 USB 备用打印前，需要安装：
