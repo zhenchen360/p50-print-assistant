@@ -2,6 +2,7 @@
     [switch]$SelfTest,
     [switch]$ProbeClipboard,
     [string]$RenderUiSnapshot = "",
+    [switch]$UsbTestPrint,
     [string]$PrinterName = "P50 Printer"
 )
 
@@ -103,6 +104,128 @@ function ConvertTo-HundredthInch([double]$mm) {
     return [int][Math]::Round($mm / 25.4 * 100.0)
 }
 
+function Read-PrintTicketXml($ticket) {
+    if ($null -eq $ticket) { return "" }
+    $stream = $ticket.GetXmlStream()
+    try {
+        $memory = New-Object System.IO.MemoryStream
+        try {
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        } finally {
+            $memory.Dispose()
+        }
+        $text = ""
+        if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+            $text = [System.Text.Encoding]::Unicode.GetString($bytes)
+            return $text.TrimStart([char]0xFEFF)
+        }
+        if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+            $text = [System.Text.Encoding]::BigEndianUnicode.GetString($bytes)
+            return $text.TrimStart([char]0xFEFF)
+        }
+        $nullBytes = 0
+        $sampleLength = [Math]::Min($bytes.Length, 200)
+        for ($i = 1; $i -lt $sampleLength; $i += 2) {
+            if ($bytes[$i] -eq 0) { $nullBytes++ }
+        }
+        if ($nullBytes -gt 20) {
+            $text = [System.Text.Encoding]::Unicode.GetString($bytes)
+            return $text.TrimStart([char]0xFEFF)
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        return $text.TrimStart([char]0xFEFF)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function New-PrintTicketFromXml([string]$xml) {
+    $stream = New-Object System.IO.MemoryStream
+    $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::Unicode, 1024, $true)
+    try {
+        $writer.Write($xml)
+        $writer.Flush()
+        $stream.Position = 0
+        return New-Object System.Printing.PrintTicket($stream)
+    } finally {
+        $writer.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Set-PrintTicketBorderOffXml([string]$xml) {
+    if (-not $xml -or $xml.IndexOf("Borders", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        return [pscustomobject]@{ Changed = $false; Xml = $xml; Previous = "" }
+    }
+    $doc = New-Object System.Xml.XmlDocument
+    $doc.PreserveWhitespace = $true
+    $doc.LoadXml($xml)
+    $node = $doc.SelectSingleNode("//*[local-name()='Feature' and @name='ns0000:Borders']/*[local-name()='Option']")
+    if ($null -eq $node) {
+        return [pscustomobject]@{ Changed = $false; Xml = $xml; Previous = "" }
+    }
+    $previous = $node.GetAttribute("name")
+    if ($previous -eq "ns0000:Off") {
+        return [pscustomobject]@{ Changed = $false; Xml = $xml; Previous = $previous }
+    }
+    $node.SetAttribute("name", "ns0000:Off")
+    $writer = New-Object System.IO.StringWriter
+    try {
+        $doc.Save($writer)
+        return [pscustomobject]@{ Changed = $true; Xml = $writer.ToString(); Previous = $previous }
+    } finally {
+        $writer.Dispose()
+    }
+}
+
+function Enter-UsbBorderlessPrintMode([string]$printerName) {
+    try {
+        Add-Type -AssemblyName ReachFramework -ErrorAction Stop
+        Add-Type -AssemblyName System.Printing -ErrorAction Stop
+        $server = New-Object System.Printing.LocalPrintServer
+        $queue = $server.GetPrintQueue($printerName)
+        $originalTicket = $queue.UserPrintTicket
+        if ($null -eq $originalTicket) { $originalTicket = $queue.DefaultPrintTicket }
+        $originalXml = Read-PrintTicketXml $originalTicket
+        $off = Set-PrintTicketBorderOffXml $originalXml
+        if (-not $off.Previous) {
+            return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "驱动票据里没有找到绘制边框选项。" }
+        }
+        if (-not $off.Changed) {
+            return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "绘制边框已经关闭。" }
+        }
+        $requested = New-PrintTicketFromXml $off.Xml
+        $validated = $queue.MergeAndValidatePrintTicket($originalTicket, $requested).ValidatedPrintTicket
+        $validatedXml = Read-PrintTicketXml $validated
+        if ($validatedXml.IndexOf("ns0000:Borders", [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+            $validatedXml.IndexOf("ns0000:Off", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "驱动没有接受关闭绘制边框的票据。" }
+        }
+        $queue.UserPrintTicket = $validated
+        $queue.Commit()
+        return [pscustomobject]@{ Applied = $true; Printer = $printerName; RestoreXml = $originalXml; Message = "已临时关闭 USB 驱动绘制边框。" }
+    } catch {
+        return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "关闭 USB 驱动绘制边框失败：$($_.Exception.Message)" }
+    }
+}
+
+function Exit-UsbBorderlessPrintMode($context) {
+    if ($null -eq $context -or -not $context.Applied -or -not $context.RestoreXml) { return }
+    try {
+        Add-Type -AssemblyName ReachFramework -ErrorAction Stop
+        Add-Type -AssemblyName System.Printing -ErrorAction Stop
+        $server = New-Object System.Printing.LocalPrintServer
+        $queue = $server.GetPrintQueue($context.Printer)
+        $queue.UserPrintTicket = New-PrintTicketFromXml $context.RestoreXml
+        $queue.Commit()
+    } catch {
+        if ($null -ne $script:statusLabel) {
+            $script:statusLabel.Text = "USB 打印已提交，但恢复驱动边框设置失败：$($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-SelectedLabelSize {
     if ($null -eq $script:sizeCombo -or $null -eq $script:sizeCombo.SelectedItem) {
         return $null
@@ -153,7 +276,7 @@ function Get-BlePrintDensityName {
 
 function Update-DensityLabel {
     if ($null -ne $script:bleDensityValueLabel) {
-        $script:bleDensityValueLabel.Text = "打印浓淡：$(Get-BlePrintDensityName)"
+        $script:bleDensityValueLabel.Text = "打印浓淡（仅蓝牙）：$(Get-BlePrintDensityName)"
     }
 }
 
@@ -622,7 +745,7 @@ function Update-Preview {
     $densityText = Get-BlePrintDensityName
     $thresholdText = if ($null -ne $script:bleThresholdBox) { $script:bleThresholdBox.Value } else { 126 }
     if ($null -ne $script:statusLabel) {
-        $script:statusLabel.Text = "标签：{0} x {1} mm | 点阵：{2} x {3} | 浓淡：{4} | 阈值：{5} | 位置 X/Y：{6:g}/{7:g} mm | 来源：{8}" -f $label.Width, $label.Height, $deviceW, $deviceH, $densityText, $thresholdText, $offsetMm.X, $offsetMm.Y, $srcText
+        $script:statusLabel.Text = "标签：{0} x {1} mm | 点阵：{2} x {3} | 蓝牙浓淡：{4} | 阈值：{5} | 位置 X/Y：{6:g}/{7:g} mm | 来源：{8}" -f $label.Width, $label.Height, $deviceW, $deviceH, $densityText, $thresholdText, $offsetMm.X, $offsetMm.Y, $srcText
     }
     if ($null -ne $script:previewCanvas) { $script:previewCanvas.Invalidate() }
 }
@@ -639,29 +762,30 @@ function Print-CurrentLabel {
     $copies = [int]$script:copiesBox.Value
     $printer = $script:printerCombo.Text.Trim()
     if (-not $printer) { $printer = $PrinterName }
-    $doc = New-Object System.Drawing.Printing.PrintDocument
-    $printBitmap = $null
-    $doc.DocumentName = "P50 {0}x{1}mm" -f $label.Width, $label.Height
-    $doc.PrinterSettings.PrinterName = $printer
-    if (-not $doc.PrinterSettings.IsValid) {
+    $printerSettings = New-Object System.Drawing.Printing.PrinterSettings
+    $printerSettings.PrinterName = $printer
+    if (-not $printerSettings.IsValid) {
         [System.Windows.Forms.MessageBox]::Show("找不到打印机：$printer", "P50 打印助手") | Out-Null
-        $doc.Dispose()
         return
     }
+    $printBitmap = $null
+    try {
+        $printBitmap = New-P50DotBitmap
+        $printBitmap.SetResolution(203.2, 203.2)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "生成 USB 打印点阵失败") | Out-Null
+        return
+    }
+    $borderContext = Enter-UsbBorderlessPrintMode $printer
+    $doc = New-Object System.Drawing.Printing.PrintDocument
+    $doc.DocumentName = "P50 {0}x{1}mm" -f $label.Width, $label.Height
+    $doc.PrinterSettings.PrinterName = $printer
     $doc.PrinterSettings.Copies = [int16]$copies
     $doc.PrintController = New-Object System.Drawing.Printing.StandardPrintController
     $doc.OriginAtMargins = $false
     $doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
     $doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize(("P50 {0}x{1}mm" -f $label.Width, $label.Height), (ConvertTo-HundredthInch $label.Width), (ConvertTo-HundredthInch $label.Height))
     $doc.DefaultPageSettings.Landscape = $false
-    try {
-        $printBitmap = New-P50DotBitmap
-        $printBitmap.SetResolution(203.2, 203.2)
-    } catch {
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "生成 USB 打印点阵失败") | Out-Null
-        $doc.Dispose()
-        return
-    }
     $doc.add_PrintPage({
         param($sender, $eventArgs)
         $g = $eventArgs.Graphics
@@ -682,12 +806,14 @@ function Print-CurrentLabel {
     })
     try {
         $doc.Print()
-        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，复用预览点阵）。"
+        $borderText = if ($borderContext.Applied) { "已临时关闭驱动绘制边框" } else { $borderContext.Message }
+        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，$borderText）。"
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "打印失败") | Out-Null
     } finally {
         if ($null -ne $printBitmap) { $printBitmap.Dispose() }
         $doc.Dispose()
+        Exit-UsbBorderlessPrintMode $borderContext
     }
 }
 
@@ -1548,7 +1674,7 @@ if ($SelfTest) {
             "1. 设备连接", "2. 标签与图片", "3. 打印微调", "4. 打印",
             "扫描 P50 蓝牙", "连接蓝牙", "断开蓝牙", "从剪贴板粘贴",
             "打开图片文件", "标签尺寸", "打印份数", "蓝牙打印",
-            "打印浓淡", "线条阈值", "5. USB 备用与诊断"
+            "打印浓淡（仅蓝牙）", "线条阈值", "5. USB 备用与诊断"
         )
         foreach ($requiredText in $requiredTexts) {
             if ($allText -notmatch [regex]::Escape($requiredText)) {
@@ -1632,6 +1758,20 @@ if ($RenderUiSnapshot) {
     $form.Close()
     $form.Dispose()
     Write-Output "UI snapshot saved: $RenderUiSnapshot"
+    exit 0
+}
+
+if ($UsbTestPrint) {
+    $script:sizeCombo.SelectedItem = "30 x 15 mm"
+    $script:copiesBox.Value = 1
+    $script:printerCombo.Text = $PrinterName
+    $syntheticImage = New-SyntheticChemDrawImage
+    Set-CurrentImage $syntheticImage "USB test synthetic image" $true
+    $syntheticImage = $null
+    Print-CurrentLabel
+    Write-Output $script:statusLabel.Text
+    if ($null -ne $state.Image) { $state.Image.Dispose() }
+    $form.Dispose()
     exit 0
 }
 
