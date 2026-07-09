@@ -34,14 +34,13 @@ Start_P50_Print_Assistant.vbs
 
 ## USB 备用与驱动
 
-蓝牙打印是推荐路径。它直接发送 P50S CommandPort 指令，能保持连接并等待打印机确认，适合日常连续打印。
+蓝牙打印是推荐路径，不需要安装 Windows 打印驱动。
 
-USB 备用路径用于蓝牙不可用、需要临时走 Windows 打印队列的情况。使用前需要先安装 P50S Windows 打印驱动，并在系统里出现 `P50 Printer` 之类的打印机名称。程序会先生成与预览一致的标签点阵，再按 USB 驱动方向做补偿后交给 Windows 打印驱动，并保持驱动的“绘制边框”关闭。P50 Windows 驱动公开的可打印宽度约为 48 mm；在 40 mm 宽 GDI 自定义页面上会出现固定边界裁剪，因此程序会对 40 mm 标签使用 48 mm 的 USB 承载页，但内容仍按真实标签尺寸绘制；最终走纸、边距和定位效果仍取决于驱动与系统打印设置。
-
-USB 打印需要安装：
+USB 备用路径用于蓝牙不可用、需要临时走 Windows 打印队列的情况。使用前需要安装：
 
 - P50S Windows 驱动：[Marklife Printer Driver P50S win](https://www.marklifeprinter.com/download/download-15-802.html)，点击 `DOWNLOAD` 安装。
-- C-Lodop：[Lodop / C-Lodop 下载中心](https://www.lodop.net/download.html)，下载并安装对应 Windows 版本的 `Web打印服务 C-Lodop`。
+
+安装后，在系统打印机列表里选择 `P50 Printer` 之类的打印机名称即可使用 USB 备用打印。
 
 ## 使用流程
 
