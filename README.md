@@ -34,9 +34,7 @@ Start_P50_Print_Assistant.vbs
 
 ## USB 备用与驱动
 
-蓝牙打印是推荐路径，不需要安装 Windows 打印驱动。
-
-USB 备用路径用于蓝牙不可用、需要临时走 Windows 打印队列的情况。使用前需要安装：
+使用 USB 备用打印前，需要安装：
 
 - P50S Windows 驱动：[Marklife Printer Driver P50S win](https://www.marklifeprinter.com/download/download-15-802.html)，点击 `DOWNLOAD` 安装。
 
