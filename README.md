@@ -4,6 +4,8 @@ Windows 桌面端凝优 P50S 热敏标签打印助手，主打快速蓝牙连接
 
 它会按标签实际点阵生成预览，再通过持续蓝牙连接发送到打印机，适合需要在 Windows 上稳定打印小标签的场景。
 
+![P50 打印助手运行截图](docs/images/app-screenshot.png)
+
 ## 下载
 
 推荐直接使用发布版：
@@ -29,6 +31,20 @@ Start_P50_Print_Assistant.vbs
 - 调整边距、X/Y 位置、线条阈值、打印浓淡
 - 保持蓝牙连接，支持连续打印
 - 提供 Windows USB 备用打印入口
+
+## USB 备用与 C-Lodop
+
+蓝牙打印是推荐路径。它直接发送 P50S CommandPort 指令，能保持连接并等待打印机确认，适合日常连续打印。
+
+USB 备用路径用于蓝牙不可用、需要临时走 Windows 打印队列的情况。使用前需要先安装 P50S Windows 打印驱动，并在系统里出现 `P50 Printer` 之类的打印机名称。USB 备用会调用 Windows 打印驱动，实际走纸、边距和定位效果取决于驱动与系统打印设置。
+
+驱动和相关依赖：
+
+- [Marklife Printer Driver P50S win](https://www.marklifeprinter.com/download/download-15-802.html)
+- [Marklife Download Center](https://www.marklifeprinter.com/Download.html)
+- [Lodop / C-Lodop 下载中心](https://www.lodop.net/download.html)
+
+C-Lodop 只在浏览器网页打印、第三方 Web 模板或旧版 Lodop 方案里需要。本项目当前桌面程序不依赖 C-Lodop；它作为排查和兼容资料保留链接。
 
 ## 使用流程
 
