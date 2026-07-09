@@ -5,6 +5,7 @@
     [string]$RenderUiSnapshot = "",
     [switch]$UsbTestPrint,
     [string]$UsbTestSize = "30 x 15 mm",
+    [switch]$UsbPrepareDriver,
     [string]$PrinterName = "P50 Printer"
 )
 
@@ -182,6 +183,33 @@ function Set-PrintTicketBorderOffXml([string]$xml) {
 }
 
 function Enter-UsbBorderlessPrintMode([string]$printerName) {
+    $printConfigurationError = ""
+    try {
+        $config = Get-PrintConfiguration -PrinterName $printerName -ErrorAction Stop
+        $ticketXml = [string]$config.PrintTicketXml
+        if (-not $ticketXml -or $ticketXml.IndexOf('Feature name="ns0000:Borders"', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "驱动配置里没有找到绘制边框选项。" }
+        }
+        if ($ticketXml -match 'Feature name="ns0000:Borders"><psf:Option name="ns0000:Off"') {
+            return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "绘制边框已经关闭。" }
+        }
+        $offXml = [regex]::Replace(
+            $ticketXml,
+            '(<psf:Feature name="ns0000:Borders"><psf:Option name=")ns0000:(On|Off)("/>)',
+            '$1ns0000:Off$3',
+            1
+        )
+        Set-PrintConfiguration -PrinterName $printerName -PrintTicketXml $offXml -ErrorAction Stop
+        Start-Sleep -Milliseconds 200
+        $verifiedXml = [string](Get-PrintConfiguration -PrinterName $printerName -ErrorAction Stop).PrintTicketXml
+        if ($verifiedXml -match 'Feature name="ns0000:Borders"><psf:Option name="ns0000:Off"') {
+            return [pscustomobject]@{ Applied = $true; Printer = $printerName; RestoreXml = ""; Message = "已关闭 USB 驱动绘制边框。" }
+        }
+        return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "驱动没有接受关闭绘制边框的配置。" }
+    } catch {
+        $printConfigurationError = $_.Exception.Message
+    }
+
     try {
         Add-Type -AssemblyName ReachFramework -ErrorAction Stop
         Add-Type -AssemblyName System.Printing -ErrorAction Stop
@@ -206,9 +234,10 @@ function Enter-UsbBorderlessPrintMode([string]$printerName) {
         }
         $queue.UserPrintTicket = $validated
         $queue.Commit()
-        return [pscustomobject]@{ Applied = $true; Printer = $printerName; RestoreXml = $originalXml; Message = "已临时关闭 USB 驱动绘制边框。" }
+        return [pscustomobject]@{ Applied = $true; Printer = $printerName; RestoreXml = $originalXml; Message = "已关闭 USB 驱动绘制边框。" }
     } catch {
-        return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "关闭 USB 驱动绘制边框失败：$($_.Exception.Message)" }
+        $detail = if ($printConfigurationError) { "$printConfigurationError；$($_.Exception.Message)" } else { $_.Exception.Message }
+        return [pscustomobject]@{ Applied = $false; Printer = $printerName; RestoreXml = ""; Message = "关闭 USB 驱动绘制边框失败：$detail" }
     }
 }
 
@@ -868,14 +897,13 @@ function Print-CurrentLabel {
     })
     try {
         $doc.Print()
-        $borderText = if ($borderContext.Applied) { "已临时关闭驱动绘制边框" } else { $borderContext.Message }
+        $borderText = if ($borderContext.Applied) { "已保持驱动绘制边框关闭" } else { $borderContext.Message }
         $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，已做 USB 方向补偿，$borderText）。"
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "打印失败") | Out-Null
     } finally {
         if ($null -ne $printBitmap) { $printBitmap.Dispose() }
         $doc.Dispose()
-        Exit-UsbBorderlessPrintMode $borderContext
     }
 }
 
@@ -1860,6 +1888,14 @@ if ($UsbTestPrint) {
     }
     Print-CurrentLabel
     Write-Output $script:statusLabel.Text
+    if ($null -ne $state.Image) { $state.Image.Dispose() }
+    $form.Dispose()
+    exit 0
+}
+
+if ($UsbPrepareDriver) {
+    $context = Enter-UsbBorderlessPrintMode $PrinterName
+    Write-Output $context.Message
     if ($null -ne $state.Image) { $state.Image.Dispose() }
     $form.Dispose()
     exit 0
