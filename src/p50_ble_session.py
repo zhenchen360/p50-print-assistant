@@ -50,7 +50,16 @@ def _response(request_id: Any, ok: bool, **payload: Any) -> str:
 
 
 def _read_line() -> str:
-    return sys.stdin.readline()
+    raw_line = sys.stdin.buffer.readline()
+    if not raw_line:
+        return ""
+    return _decode_request_bytes(raw_line)
+
+
+def _decode_request_bytes(raw_line: bytes) -> str:
+    if raw_line.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw_line.decode("utf-16")
+    return raw_line.decode("utf-8-sig")
 
 
 def _parse_request_line(line: str) -> dict[str, Any]:

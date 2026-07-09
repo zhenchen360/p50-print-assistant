@@ -5,8 +5,12 @@ import sys
 import time
 
 
-for raw_line in sys.stdin:
-    request = json.loads(raw_line.lstrip("\ufeff"))
+for raw_bytes in sys.stdin.buffer:
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+        raw_line = raw_bytes.decode("utf-16")
+    else:
+        raw_line = raw_bytes.decode("utf-8-sig")
+    request = json.loads(raw_line)
     command = request.get("cmd")
     if command == "delay":
         time.sleep(float(request.get("seconds", 0)))

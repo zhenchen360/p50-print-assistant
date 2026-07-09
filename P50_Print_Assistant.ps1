@@ -1092,6 +1092,7 @@ function Start-P50BleSessionHelper {
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $psi.StandardOutputEncoding = $utf8NoBom
     $psi.StandardErrorEncoding = $utf8NoBom

@@ -13,7 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from p50_ble_probe import APK_LUCKP_CONTROL, APK_LUCKP_NOTIFY, APK_P50S_NOTIFY  # noqa: E402
-from p50_ble_session import JobCompletionTimeoutError, P50BleSession, _parse_request_line  # noqa: E402
+from p50_ble_session import (  # noqa: E402
+    JobCompletionTimeoutError,
+    P50BleSession,
+    _decode_request_bytes,
+    _parse_request_line,
+)
 
 
 class FakeBleClient:
@@ -74,9 +79,16 @@ def attach_client(session: P50BleSession, client: FakeBleClient, flow_control: s
 
 class CreditProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_parser_accepts_utf8_bom(self) -> None:
-        request = _parse_request_line('\ufeff{"id":7,"cmd":"status"}')
+        line = _decode_request_bytes(b'\xef\xbb\xbf{"id":7,"cmd":"status"}\r\n')
+        request = _parse_request_line(line)
 
         self.assertEqual(request, {"id": 7, "cmd": "status"})
+
+    async def test_request_parser_accepts_utf16_bom(self) -> None:
+        line = _decode_request_bytes('{"id":8,"cmd":"status"}\r\n'.encode("utf-16"))
+        request = _parse_request_line(line)
+
+        self.assertEqual(request, {"id": 8, "cmd": "status"})
 
     async def test_control_notifications_follow_app_credit_rules(self) -> None:
         session = P50BleSession()
