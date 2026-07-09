@@ -1637,10 +1637,12 @@ $script:aspectCheck.Checked = $true
 $script:cropFillCheck = New-Object System.Windows.Forms.CheckBox
 $script:cropFillCheck.Text = "裁切铺满"
 $script:cropFillCheck.Checked = $false
-$marginAspectRow = New-EqualRow 3
+$fitOptionRow = New-EqualRow 2
+Add-RowItem $fitOptionRow $script:aspectCheck 0 8
+Add-RowItem $fitOptionRow $script:cropFillCheck 1 0
+$marginAspectRow = New-EqualRow 2
 Add-RowItem $marginAspectRow (New-TuningBlock $script:marginValueLabel $script:marginSlider) 0 8
-Add-RowItem $marginAspectRow $script:aspectCheck 1 8
-Add-RowItem $marginAspectRow $script:cropFillCheck 2 0
+Add-RowItem $marginAspectRow $fitOptionRow 1 0
 Add-Control $tuningSection $marginAspectRow 50
 
 $printSection = Add-Section "4. 打印"
