@@ -53,6 +53,13 @@ def _read_line() -> str:
     return sys.stdin.readline()
 
 
+def _parse_request_line(line: str) -> dict[str, Any]:
+    request = json.loads(line.lstrip("\ufeff"))
+    if not isinstance(request, dict):
+        raise ValueError("BLE session request must be a JSON object.")
+    return request
+
+
 def _job_summary(job: bytes) -> dict[str, Any]:
     return {
         "bytes": len(job),
@@ -447,7 +454,7 @@ async def main() -> int:
         request_id: Any = None
         session.logs = []
         try:
-            request = json.loads(line)
+            request = _parse_request_line(line)
             request_id = request.get("id")
             command = request.get("cmd")
             result: dict[str, Any]

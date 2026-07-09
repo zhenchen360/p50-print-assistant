@@ -85,6 +85,7 @@ $script:bleSessionRequestId = 0
 $script:bleSessionConnected = $false
 $script:bleSessionAddress = ""
 $script:bleSessionName = ""
+$script:bleSessionInputWriter = $null
 $script:bleSessionReadTask = $null
 $script:bleSessionCommandInProgress = $false
 $script:bleUiBusy = $false
@@ -1091,11 +1092,16 @@ function Start-P50BleSessionHelper {
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $psi.StandardOutputEncoding = $utf8NoBom
+    $psi.StandardErrorEncoding = $utf8NoBom
     $psi.CreateNoWindow = $true
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     [void]$proc.Start()
     $script:bleSessionProcess = $proc
+    $script:bleSessionInputWriter = New-Object System.IO.StreamWriter($proc.StandardInput.BaseStream, $utf8NoBom)
+    $script:bleSessionInputWriter.AutoFlush = $true
     $script:bleSessionReadTask = $null
     $script:bleSessionConnected = $false
 }
@@ -1115,7 +1121,11 @@ function Reset-P50BleSessionHelper([bool]$Terminate = $false) {
             try { $process.Dispose() } catch {}
         }
     }
+    if ($null -ne $script:bleSessionInputWriter) {
+        try { $script:bleSessionInputWriter.Dispose() } catch {}
+    }
     $script:bleSessionProcess = $null
+    $script:bleSessionInputWriter = $null
     $script:bleSessionReadTask = $null
     $script:bleSessionConnected = $false
     $script:bleSessionAddress = ""
@@ -1135,8 +1145,9 @@ function Invoke-P50BleSessionCommand([hashtable]$Payload, [int]$TimeoutMs = 4500
         $script:lastBleSessionResponse = $null
         $Payload["id"] = $requestId
         $json = $Payload | ConvertTo-Json -Compress -Depth 8
-        $script:bleSessionProcess.StandardInput.WriteLine($json)
-        $script:bleSessionProcess.StandardInput.Flush()
+        if ($null -eq $script:bleSessionInputWriter) { throw "蓝牙会话输入通道未初始化。" }
+        $script:bleSessionInputWriter.WriteLine($json)
+        $script:bleSessionInputWriter.Flush()
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($script:bleSessionProcess.HasExited) {

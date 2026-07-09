@@ -6,7 +6,7 @@ import time
 
 
 for raw_line in sys.stdin:
-    request = json.loads(raw_line)
+    request = json.loads(raw_line.lstrip("\ufeff"))
     command = request.get("cmd")
     if command == "delay":
         time.sleep(float(request.get("seconds", 0)))

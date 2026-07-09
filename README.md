@@ -93,7 +93,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\P50_Print_Assistant.ps1 -B
 构建经过自测的便携发布包：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_release.ps1 -Version 0.1.3
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_release.ps1 -Version 0.1.4
 ```
 
 蓝牙打印的最近 10 次预览、任务字节和诊断日志保存在
