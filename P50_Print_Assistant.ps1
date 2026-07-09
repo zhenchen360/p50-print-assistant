@@ -112,15 +112,14 @@ function Get-UsbDriverGeometry($label) {
     $paperHeight = [double]$label.Height
     $drawWidth = [double]$label.Width
     $drawHeight = [double]$label.Height
-    $guardMm = 0.0
+    $carrierExtraMm = 0.0
 
-    # The P50 Windows driver clips/draws a fixed vertical edge when GDI custom
-    # pages reach the 40 mm width boundary. 30 mm labels do not hit it. Keep a
-    # small USB-only guard band for 40 mm labels; BLE and preview stay exact.
-    if ($label.Width -ge 39.9) {
-        $guardMm = 1.0
-        $paperWidth = [Math]::Max(1.0, $label.Width - $guardMm)
-        $drawWidth = $paperWidth
+    # The P50 Windows driver exposes 58 mm media names, but the actual GDI
+    # imageable width is about 48 mm. A 40 mm custom page hits a driver edge;
+    # use the driver's 48 mm carrier width and still draw content at true size.
+    if ($label.Width -ge 39.9 -and $label.Width -le 48.1) {
+        $paperWidth = 48.0
+        $carrierExtraMm = $paperWidth - [double]$label.Width
     }
 
     return [pscustomobject]@{
@@ -128,7 +127,7 @@ function Get-UsbDriverGeometry($label) {
         PaperHeight = $paperHeight
         DrawWidth = $drawWidth
         DrawHeight = $drawHeight
-        GuardMm = $guardMm
+        CarrierExtraMm = $carrierExtraMm
     }
 }
 
@@ -924,8 +923,8 @@ function Print-CurrentLabel {
     try {
         $doc.Print()
         $borderText = if ($borderContext.Applied) { "已保持驱动绘制边框关闭" } else { $borderContext.Message }
-        $guardText = if ($usbGeometry.GuardMm -gt 0) { "，40mm 标签已使用 $($usbGeometry.PaperWidth)mm USB 安全宽度" } else { "" }
-        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，已做 USB 方向补偿$guardText，$borderText）。"
+        $carrierText = if ($usbGeometry.CarrierExtraMm -gt 0) { "，40mm 标签已使用 $($usbGeometry.PaperWidth)mm USB 承载页" } else { "" }
+        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，已做 USB 方向补偿$carrierText，$borderText）。"
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "打印失败") | Out-Null
     } finally {
