@@ -76,7 +76,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\P50_Print_Assistant.p
 
 当前主要面向凝优 P50S 热敏标签打印机，标签宽度按 8 点/mm 渲染。
 
-欢迎提交更多标签尺寸、固件变体适配、阈值算法改进和打包流程优化。
+欢迎提交更多标签尺寸、固件变体适配和阈值算法改进。
 
 ## License
 
