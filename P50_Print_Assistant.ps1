@@ -107,6 +107,31 @@ function ConvertTo-HundredthInch([double]$mm) {
     return [int][Math]::Round($mm / 25.4 * 100.0)
 }
 
+function Get-UsbDriverGeometry($label) {
+    $paperWidth = [double]$label.Width
+    $paperHeight = [double]$label.Height
+    $drawWidth = [double]$label.Width
+    $drawHeight = [double]$label.Height
+    $guardMm = 0.0
+
+    # The P50 Windows driver clips/draws a fixed vertical edge when GDI custom
+    # pages reach the 40 mm width boundary. 30 mm labels do not hit it. Keep a
+    # small USB-only guard band for 40 mm labels; BLE and preview stay exact.
+    if ($label.Width -ge 39.9) {
+        $guardMm = 1.0
+        $paperWidth = [Math]::Max(1.0, $label.Width - $guardMm)
+        $drawWidth = $paperWidth
+    }
+
+    return [pscustomobject]@{
+        PaperWidth = $paperWidth
+        PaperHeight = $paperHeight
+        DrawWidth = $drawWidth
+        DrawHeight = $drawHeight
+        GuardMm = $guardMm
+    }
+}
+
 function Read-PrintTicketXml($ticket) {
     if ($null -eq $ticket) { return "" }
     $stream = $ticket.GetXmlStream()
@@ -868,6 +893,7 @@ function Print-CurrentLabel {
         return
     }
     $borderContext = Enter-UsbBorderlessPrintMode $printer
+    $usbGeometry = Get-UsbDriverGeometry $label
     $doc = New-Object System.Drawing.Printing.PrintDocument
     $doc.DocumentName = "P50 {0}x{1}mm" -f $label.Width, $label.Height
     $doc.PrinterSettings.PrinterName = $printer
@@ -875,7 +901,7 @@ function Print-CurrentLabel {
     $doc.PrintController = New-Object System.Drawing.Printing.StandardPrintController
     $doc.OriginAtMargins = $false
     $doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
-    $doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize(("P50 {0}x{1}mm" -f $label.Width, $label.Height), (ConvertTo-HundredthInch $label.Width), (ConvertTo-HundredthInch $label.Height))
+    $doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize(("P50 USB {0}x{1}mm" -f $usbGeometry.PaperWidth, $usbGeometry.PaperHeight), (ConvertTo-HundredthInch $usbGeometry.PaperWidth), (ConvertTo-HundredthInch $usbGeometry.PaperHeight))
     $doc.DefaultPageSettings.Landscape = $false
     $doc.add_PrintPage({
         param($sender, $eventArgs)
@@ -891,14 +917,15 @@ function Print-CurrentLabel {
         if ($hardMarginXmm -ne 0 -or $hardMarginYmm -ne 0) {
             $g.TranslateTransform(-$hardMarginXmm, -$hardMarginYmm)
         }
-        $dest = New-Object System.Drawing.Rectangle(0, 0, [int][Math]::Round($label.Width), [int][Math]::Round($label.Height))
+        $dest = New-Object System.Drawing.Rectangle(0, 0, [int][Math]::Round($usbGeometry.DrawWidth), [int][Math]::Round($usbGeometry.DrawHeight))
         $g.DrawImage($printBitmap, $dest, [single]0, [single]0, [single]$printBitmap.Width, [single]$printBitmap.Height, [System.Drawing.GraphicsUnit]::Pixel)
         $eventArgs.HasMorePages = $false
     })
     try {
         $doc.Print()
         $borderText = if ($borderContext.Applied) { "已保持驱动绘制边框关闭" } else { $borderContext.Message }
-        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，已做 USB 方向补偿，$borderText）。"
+        $guardText = if ($usbGeometry.GuardMm -gt 0) { "，40mm 标签已使用 $($usbGeometry.PaperWidth)mm USB 安全宽度" } else { "" }
+        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，已做 USB 方向补偿$guardText，$borderText）。"
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "打印失败") | Out-Null
     } finally {
