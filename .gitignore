@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# PowerShell / Windows noise
+*.ps1xml
+Thumbs.db
+Desktop.ini
+
+# Build output
+.build/
+build/
+dist/
+portable/
+*.spec
+
+# Runtime logs and generated print jobs
+p50_ble_runs/
+*.job.bin
+*.log
+*.log.txt
+*.pcapng
+*.etl
+
+# Local research captures and third-party app artifacts should not be committed.
+*_capture_*/
+apk_extract*/
+*.apk
+*.apks
+*.xapk
+
+# Generated previews/screenshots
+*_preview.png
+*_snapshot*.png
