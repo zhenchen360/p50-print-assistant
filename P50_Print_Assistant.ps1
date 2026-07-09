@@ -594,26 +594,35 @@ function Try-SetImageFromClipboard([string]$sourcePrefix) {
     return $false
 }
 
-function Get-DestinationRectMm($label, [double]$marginMm, [bool]$preserveAspect) {
+function Get-ContentRectMm($label, [double]$marginMm) {
     $x = [single]$marginMm
     $y = [single]$marginMm
     $w = [single]([Math]::Max(0.1, $label.Width - 2 * $marginMm))
     $h = [single]([Math]::Max(0.1, $label.Height - 2 * $marginMm))
+    return New-Object System.Drawing.RectangleF($x, $y, $w, $h)
+}
+
+function Get-DestinationRectMm($label, [double]$marginMm, [bool]$preserveAspect, [bool]$cropToFill) {
+    $box = Get-ContentRectMm $label $marginMm
+    $x = $box.X
+    $y = $box.Y
+    $w = $box.Width
+    $h = $box.Height
     if (-not $preserveAspect -or $null -eq $state.Image) {
         return New-Object System.Drawing.RectangleF($x, $y, $w, $h)
     }
     $srcAspect = [double]$state.Image.Width / [double]$state.Image.Height
     $boxAspect = [double]$w / [double]$h
-    if ($srcAspect -gt $boxAspect) {
-        $drawW = $w
-        $drawH = [single]($w / $srcAspect)
-        $drawX = $x
-        $drawY = [single]($y + ($h - $drawH) / 2)
-    } else {
+    if (($cropToFill -and $srcAspect -gt $boxAspect) -or ((-not $cropToFill) -and $srcAspect -le $boxAspect)) {
         $drawH = $h
         $drawW = [single]($h * $srcAspect)
         $drawX = [single]($x + ($w - $drawW) / 2)
         $drawY = $y
+    } else {
+        $drawW = $w
+        $drawH = [single]($w / $srcAspect)
+        $drawX = $x
+        $drawY = [single]($y + ($h - $drawH) / 2)
     }
     return New-Object System.Drawing.RectangleF($drawX, $drawY, $drawW, $drawH)
 }
@@ -693,15 +702,26 @@ function New-P50GrayDotBitmap {
         $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
         $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::SingleBitPerPixelGridFit
         $marginMm = Get-MarginMm
-        $destMm = Get-DestinationRectMm $label $marginMm $script:aspectCheck.Checked
+        $cropToFill = ($null -ne $script:cropFillCheck -and $script:cropFillCheck.Checked)
+        $contentMm = Get-ContentRectMm $label $marginMm
+        $destMm = Get-DestinationRectMm $label $marginMm $script:aspectCheck.Checked $cropToFill
         $offsetMm = Get-BleImageOffsetMm
+        $contentPx = New-Object System.Drawing.RectangleF(
+            [single]($contentMm.X * $renderPxPerMm),
+            [single]($contentMm.Y * $renderPxPerMm),
+            [single]($contentMm.Width * $renderPxPerMm),
+            [single]($contentMm.Height * $renderPxPerMm)
+        )
         $destPx = New-Object System.Drawing.RectangleF(
             [single](($destMm.X + $offsetMm.X) * $renderPxPerMm),
             [single](($destMm.Y + $offsetMm.Y) * $renderPxPerMm),
             [single]($destMm.Width * $renderPxPerMm),
             [single]($destMm.Height * $renderPxPerMm)
         )
-        if ($null -ne $state.Image) { $graphics.DrawImage($state.Image, $destPx) }
+        if ($null -ne $state.Image) {
+            if ($cropToFill) { $graphics.SetClip($contentPx) }
+            try { $graphics.DrawImage($state.Image, $destPx) } finally { if ($cropToFill) { $graphics.ResetClip() } }
+        }
         $graphics.Dispose(); $graphics = $null
         $downsampleGraphics = [System.Drawing.Graphics]::FromImage($bitmap)
         $downsampleGraphics.Clear([System.Drawing.Color]::White)
@@ -1614,9 +1634,13 @@ $script:marginSlider = New-CompactSlider 0 80 10 10 1 5
 $script:aspectCheck = New-Object System.Windows.Forms.CheckBox
 $script:aspectCheck.Text = "保持比例"
 $script:aspectCheck.Checked = $true
-$marginAspectRow = New-EqualRow 2
+$script:cropFillCheck = New-Object System.Windows.Forms.CheckBox
+$script:cropFillCheck.Text = "裁切铺满"
+$script:cropFillCheck.Checked = $false
+$marginAspectRow = New-EqualRow 3
 Add-RowItem $marginAspectRow (New-TuningBlock $script:marginValueLabel $script:marginSlider) 0 8
-Add-RowItem $marginAspectRow $script:aspectCheck 1 0
+Add-RowItem $marginAspectRow $script:aspectCheck 1 8
+Add-RowItem $marginAspectRow $script:cropFillCheck 2 0
 Add-Control $tuningSection $marginAspectRow 50
 
 $printSection = Add-Section "4. 打印"
@@ -1653,6 +1677,7 @@ Add-Control $diagnosticSection $diagnosticButtonRow 36
 $script:sizeCombo.Add_SelectedIndexChanged({ Set-AutoThresholdFromCurrentImage; Update-Preview; Update-BleSessionUi; Update-ImportUi })
 $script:marginSlider.Add_ValueChanged({ Update-MarginLabel; Update-Preview })
 $script:aspectCheck.Add_CheckedChanged({ Update-Preview })
+$script:cropFillCheck.Add_CheckedChanged({ Update-Preview })
 $script:bleDensitySlider.Add_ValueChanged({ Update-DensityLabel; Update-Preview })
 $script:bleXOffsetSlider.Add_ValueChanged({ Update-OffsetLabels; Update-Preview })
 $script:bleYOffsetSlider.Add_ValueChanged({ Update-OffsetLabels; Update-Preview })
@@ -1825,6 +1850,9 @@ if ($SelfTest) {
         if ($script:bleXOffsetSlider.Minimum -ne -100 -or $script:bleXOffsetSlider.Maximum -ne 100 -or $script:bleYOffsetSlider.Minimum -ne -100 -or $script:bleYOffsetSlider.Maximum -ne 100) {
             throw "UI self-test expected X/Y offset sliders to cover -10.0 to +10.0 mm."
         }
+        if ($script:cropFillCheck.Text -ne "裁切铺满" -or $script:cropFillCheck.Checked) {
+            throw "UI self-test expected crop-fill to be available and disabled by default."
+        }
         $forbiddenTexts = @("2. 导入图片", "Connect, list, disconnect", "Disconnect BLE", "Print to P50 BLE", "Test Bluetooth services", "auto-connects", "USB continuous feed mode", "USB driver gap-label mode", "通过 Word 渲染粘贴", "Word 渲染", "从 ChemDraw 粘贴", "打开上次预览", "打开上次日志")
         foreach ($forbiddenText in $forbiddenTexts) {
             if ($allText -match [regex]::Escape($forbiddenText)) {
@@ -1858,9 +1886,29 @@ if ($SelfTest) {
         }
         if ($blackPixels -lt 50) { throw "BLE render self-test produced too few black pixels: $blackPixels" }
         Write-Output ("BLE render self-test OK: {0} x {1}, blackPixels={2}" -f $dotBitmap.Width, $dotBitmap.Height, $blackPixels)
+        if ($null -ne $dotBitmap) { $dotBitmap.Dispose(); $dotBitmap = $null }
+
+        $squareImage = New-Object System.Drawing.Bitmap(300, 300, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $squareGraphics = [System.Drawing.Graphics]::FromImage($squareImage)
+        try { $squareGraphics.Clear([System.Drawing.Color]::Black) } finally { $squareGraphics.Dispose() }
+        Set-CurrentImage $squareImage "selftest square fill image" $true
+        $squareImage = $null
+        $script:bleThresholdBox.Value = 126
+        $script:cropFillCheck.Checked = $false
+        $containBitmap = New-P50DotBitmap
+        $script:cropFillCheck.Checked = $true
+        $coverBitmap = New-P50DotBitmap
+        $containEdgePixel = $containBitmap.GetPixel(10, 60)
+        $coverEdgePixel = $coverBitmap.GetPixel(10, 60)
+        if ($containEdgePixel.R -lt 128) { throw "Crop-fill self-test expected contain mode to preserve side whitespace." }
+        if ($coverEdgePixel.R -ge 128) { throw "Crop-fill self-test expected fill mode to crop and cover the content area." }
+        Write-Output "Crop-fill self-test OK"
     } finally {
         if ($null -ne $syntheticImage) { $syntheticImage.Dispose() }
         if ($null -ne $dotBitmap) { $dotBitmap.Dispose() }
+        if ($null -ne $squareImage) { $squareImage.Dispose() }
+        if ($null -ne $containBitmap) { $containBitmap.Dispose() }
+        if ($null -ne $coverBitmap) { $coverBitmap.Dispose() }
     }
     Write-Output $bleRuntimeSummary
     Write-Output "SelfTest OK"
