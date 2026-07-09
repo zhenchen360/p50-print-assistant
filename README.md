@@ -32,19 +32,19 @@ Start_P50_Print_Assistant.vbs
 - 保持蓝牙连接，支持连续打印
 - 提供 Windows USB 备用打印入口
 
-## USB 备用与 C-Lodop
+## USB 备用与网页打印组件
 
 蓝牙打印是推荐路径。它直接发送 P50S CommandPort 指令，能保持连接并等待打印机确认，适合日常连续打印。
 
 USB 备用路径用于蓝牙不可用、需要临时走 Windows 打印队列的情况。使用前需要先安装 P50S Windows 打印驱动，并在系统里出现 `P50 Printer` 之类的打印机名称。USB 备用会调用 Windows 打印驱动，实际走纸、边距和定位效果取决于驱动与系统打印设置。
 
-驱动和相关依赖：
+需要下载什么：
 
-- [Marklife Printer Driver P50S win](https://www.marklifeprinter.com/download/download-15-802.html)
-- [Marklife Download Center](https://www.marklifeprinter.com/Download.html)
-- [Lodop / C-Lodop 下载中心](https://www.lodop.net/download.html)
+- 只用蓝牙打印：不需要安装打印驱动，也不需要安装 C-Lodop。
+- 使用本项目的 USB 备用打印：下载并安装 [Marklife Printer Driver P50S win](https://www.marklifeprinter.com/download/download-15-802.html) 页面里的 `DOWNLOAD` 驱动包。安装后，在 Windows 打印机列表里选择 P50S 对应的打印机。
+- 使用浏览器网页打印、第三方 Web 模板，或遇到“未检测到 C-Lodop”提示：到 [Lodop / C-Lodop 下载中心](https://www.lodop.net/download.html) 下载网页打印服务。普通 Windows 桌面优先看 `Windows32版` 里的 `Web打印服务 C-Lodop` / `CLodop_Setup_for_Win32NT.exe`；明确需要 64 位服务端时，再看 `Windows64版` 的 C-Lodop 安装包。
 
-C-Lodop 只在浏览器网页打印、第三方 Web 模板或旧版 Lodop 方案里需要。本项目当前桌面程序不依赖 C-Lodop；它作为排查和兼容资料保留链接。
+C-Lodop 是浏览器和网页模板调用本机打印机的服务组件，不参与本项目的蓝牙打印路径。它放在这里是为了说明：如果你只是运行这个桌面程序，先不要装它；如果你另行使用网页打印方案，再按上面的说明安装。
 
 ## 使用流程
 
