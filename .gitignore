@@ -35,3 +35,5 @@ apk_extract*/
 # Generated previews/screenshots
 *_preview.png
 *_snapshot*.png
+p50_probe_clipboard_*.png
+p50_usb_test_*.png

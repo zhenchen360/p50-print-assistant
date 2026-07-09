@@ -1,8 +1,10 @@
 ﻿param(
     [switch]$SelfTest,
     [switch]$ProbeClipboard,
+    [string]$ProbeLabelSize = "30 x 15 mm",
     [string]$RenderUiSnapshot = "",
     [switch]$UsbTestPrint,
+    [string]$UsbTestSize = "30 x 15 mm",
     [string]$PrinterName = "P50 Printer"
 )
 
@@ -241,6 +243,13 @@ function Require-SelectedLabelSize {
     $label = Get-SelectedLabelSize
     if ($null -eq $label) { throw "请先选择标签尺寸。" }
     return $label
+}
+
+function Select-LabelSizeByName([string]$sizeName) {
+    if (-not $labelSizes.Contains($sizeName)) {
+        throw "未知标签尺寸：$sizeName。可选：$($labelSizes.Keys -join ', ')"
+    }
+    $script:sizeCombo.SelectedItem = $sizeName
 }
 
 function Get-BleImageOffsetMm {
@@ -664,6 +673,60 @@ function New-P50DotBitmap {
     }
 }
 
+function Copy-Rotated180Bitmap([System.Drawing.Bitmap]$bitmap) {
+    $copy = $bitmap.Clone()
+    $copy.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipNone)
+    return $copy
+}
+
+function New-UsbDriverBitmap {
+    $logicalBitmap = New-P50DotBitmap
+    try {
+        $driverBitmap = Copy-Rotated180Bitmap $logicalBitmap
+        $driverBitmap.SetResolution(203.2, 203.2)
+        return $driverBitmap
+    } finally {
+        if ($null -ne $logicalBitmap) { $logicalBitmap.Dispose() }
+    }
+}
+
+function Count-BlackPixelsInRect([System.Drawing.Bitmap]$bitmap, [int]$x0, [int]$y0, [int]$width, [int]$height) {
+    $count = 0
+    $x1 = [Math]::Min($bitmap.Width, $x0 + $width)
+    $y1 = [Math]::Min($bitmap.Height, $y0 + $height)
+    for ($y = [Math]::Max(0, $y0); $y -lt $y1; $y++) {
+        for ($x = [Math]::Max(0, $x0); $x -lt $x1; $x++) {
+            $pixel = $bitmap.GetPixel($x, $y)
+            if ($pixel.R -lt 128) { $count++ }
+        }
+    }
+    return $count
+}
+
+function Get-BitmapEdgeStats([System.Drawing.Bitmap]$bitmap) {
+    $bandDots = [Math]::Max(1, [Math]::Min(8, [Math]::Floor([Math]::Min($bitmap.Width, $bitmap.Height) / 4)))
+    return [pscustomobject]@{
+        Width = $bitmap.Width
+        Height = $bitmap.Height
+        TotalBlack = Count-BlackPixelsInRect $bitmap 0 0 $bitmap.Width $bitmap.Height
+        LeftColumn = Count-BlackPixelsInRect $bitmap 0 0 1 $bitmap.Height
+        RightColumn = Count-BlackPixelsInRect $bitmap ($bitmap.Width - 1) 0 1 $bitmap.Height
+        TopRow = Count-BlackPixelsInRect $bitmap 0 0 $bitmap.Width 1
+        BottomRow = Count-BlackPixelsInRect $bitmap 0 ($bitmap.Height - 1) $bitmap.Width 1
+        LeftBand = Count-BlackPixelsInRect $bitmap 0 0 $bandDots $bitmap.Height
+        RightBand = Count-BlackPixelsInRect $bitmap ($bitmap.Width - $bandDots) 0 $bandDots $bitmap.Height
+        TopBand = Count-BlackPixelsInRect $bitmap 0 0 $bitmap.Width $bandDots
+        BottomBand = Count-BlackPixelsInRect $bitmap 0 ($bitmap.Height - $bandDots) $bitmap.Width $bandDots
+        BandDots = $bandDots
+    }
+}
+
+function Format-BitmapEdgeStats($name, $stats) {
+    return "{0}: {1}x{2}; totalBlack={3}; col L/R={4}/{5}; row T/B={6}/{7}; {8}-dot band L/R/T/B={9}/{10}/{11}/{12}" -f `
+        $name, $stats.Width, $stats.Height, $stats.TotalBlack, $stats.LeftColumn, $stats.RightColumn, `
+        $stats.TopRow, $stats.BottomRow, $stats.BandDots, $stats.LeftBand, $stats.RightBand, $stats.TopBand, $stats.BottomBand
+}
+
 function New-P50PreviewBitmap {
     $bitmap = New-P50DotBitmap
     try { return $bitmap.Clone() } finally { $bitmap.Dispose() }
@@ -770,8 +833,7 @@ function Print-CurrentLabel {
     }
     $printBitmap = $null
     try {
-        $printBitmap = New-P50DotBitmap
-        $printBitmap.SetResolution(203.2, 203.2)
+        $printBitmap = New-UsbDriverBitmap
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "生成 USB 打印点阵失败") | Out-Null
         return
@@ -807,7 +869,7 @@ function Print-CurrentLabel {
     try {
         $doc.Print()
         $borderText = if ($borderContext.Applied) { "已临时关闭驱动绘制边框" } else { $borderContext.Message }
-        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，$borderText）。"
+        $script:statusLabel.Text = "已发送到 ${printer}：$($label.Width) x $($label.Height) mm，$copies 份（Windows 驱动，已做 USB 方向补偿，$borderText）。"
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "打印失败") | Out-Null
     } finally {
@@ -1618,7 +1680,9 @@ Update-BleSessionUi
 Update-ImportUi
 
 if ($ProbeClipboard) {
-    $script:sizeCombo.SelectedItem = "30 x 15 mm"
+    Select-LabelSizeByName $ProbeLabelSize
+    $sizeTag = ($script:sizeCombo.SelectedItem.ToString() -replace '[^0-9]+', 'x').Trim('x')
+    Write-Output ("ProbeLabelSize: {0}" -f $script:sizeCombo.SelectedItem)
     Write-Output (Get-ClipboardDiagnosticText)
     $probeMetafile = $null
     try {
@@ -1639,13 +1703,21 @@ if ($ProbeClipboard) {
         if ($pastePathOk -and $null -ne $state.Image) {
             Write-Output ("LoadedImage: source={0}, width={1}, height={2}" -f $state.ImagePath, $state.Image.Width, $state.Image.Height)
             Write-Output ("AutoThreshold: {0}" -f $script:bleThresholdBox.Value)
-            $probePreviewPath = Join-Path (Get-BaseDir) "p50_probe_clipboard_preview.png"
+            $probePreviewPath = Join-Path (Get-BaseDir) "p50_probe_clipboard_${sizeTag}_preview.png"
+            $probeUsbRotatedPath = Join-Path (Get-BaseDir) "p50_probe_clipboard_${sizeTag}_usb_rot180_reference.png"
             $probePreview = $null
+            $probeUsbRotated = $null
             try {
                 $probePreview = New-P50PreviewBitmap
                 $probePreview.Save($probePreviewPath, [System.Drawing.Imaging.ImageFormat]::Png)
                 Write-Output ("ProbePreview: {0}" -f $probePreviewPath)
+                Write-Output (Format-BitmapEdgeStats "PreviewDotBitmap" (Get-BitmapEdgeStats $probePreview))
+                $probeUsbRotated = Copy-Rotated180Bitmap $probePreview
+                $probeUsbRotated.Save($probeUsbRotatedPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                Write-Output ("UsbRot180Reference: {0}" -f $probeUsbRotatedPath)
+                Write-Output (Format-BitmapEdgeStats "UsbRot180Reference" (Get-BitmapEdgeStats $probeUsbRotated))
             } finally {
+                if ($null -ne $probeUsbRotated) { $probeUsbRotated.Dispose() }
                 if ($null -ne $probePreview) { $probePreview.Dispose() }
             }
         }
@@ -1762,12 +1834,30 @@ if ($RenderUiSnapshot) {
 }
 
 if ($UsbTestPrint) {
-    $script:sizeCombo.SelectedItem = "30 x 15 mm"
+    Select-LabelSizeByName $UsbTestSize
     $script:copiesBox.Value = 1
     $script:printerCombo.Text = $PrinterName
     $syntheticImage = New-SyntheticChemDrawImage
     Set-CurrentImage $syntheticImage "USB test synthetic image" $true
     $syntheticImage = $null
+    $usbSizeTag = ($script:sizeCombo.SelectedItem.ToString() -replace '[^0-9]+', 'x').Trim('x')
+    $usbLogicalPath = Join-Path (Get-BaseDir) "p50_usb_test_${usbSizeTag}_logical_preview.png"
+    $usbDiagnosticPath = Join-Path (Get-BaseDir) "p50_usb_test_${usbSizeTag}_driver_input.png"
+    $usbLogical = $null
+    $usbDiagnostic = $null
+    try {
+        $usbLogical = New-P50DotBitmap
+        $usbLogical.Save($usbLogicalPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        Write-Output ("UsbLogicalPreview: {0}" -f $usbLogicalPath)
+        Write-Output (Format-BitmapEdgeStats "UsbLogicalPreview" (Get-BitmapEdgeStats $usbLogical))
+        $usbDiagnostic = Copy-Rotated180Bitmap $usbLogical
+        $usbDiagnostic.Save($usbDiagnosticPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        Write-Output ("UsbDriverInput: {0}" -f $usbDiagnosticPath)
+        Write-Output (Format-BitmapEdgeStats "UsbDriverInput" (Get-BitmapEdgeStats $usbDiagnostic))
+    } finally {
+        if ($null -ne $usbDiagnostic) { $usbDiagnostic.Dispose() }
+        if ($null -ne $usbLogical) { $usbLogical.Dispose() }
+    }
     Print-CurrentLabel
     Write-Output $script:statusLabel.Text
     if ($null -ne $state.Image) { $state.Image.Dispose() }
