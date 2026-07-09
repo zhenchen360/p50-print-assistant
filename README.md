@@ -38,12 +38,10 @@ Start_P50_Print_Assistant.vbs
 
 USB 备用路径用于蓝牙不可用、需要临时走 Windows 打印队列的情况。使用前需要先安装 P50S Windows 打印驱动，并在系统里出现 `P50 Printer` 之类的打印机名称。USB 备用会调用 Windows 打印驱动，实际走纸、边距和定位效果取决于驱动与系统打印设置。
 
-需要下载什么：
+USB 打印需要安装：
 
-- 只用蓝牙打印：不需要安装打印驱动，也不需要安装 C-Lodop。
-- 需要 USB 打印：需要同时安装 P50S Windows 驱动和 C-Lodop。
-- P50S Windows 驱动：打开 [Marklife Printer Driver P50S win](https://www.marklifeprinter.com/download/download-15-802.html)，点击页面里的 `DOWNLOAD`，安装驱动。安装后，在本程序的 USB 备用区选择 P50S 对应的 Windows 打印机。
-- C-Lodop：打开 [Lodop / C-Lodop 下载中心](https://www.lodop.net/download.html)。普通 Windows 用户下载 `Windows32版` 里的 `Web打印服务 C-Lodop` / `CLodop_Setup_for_Win32NT.exe`；明确需要 64 位服务端时，下载 `Windows64版` 的 `CLodop6.642_Setup_Win64EN.zip`。
+- P50S Windows 驱动：[Marklife Printer Driver P50S win](https://www.marklifeprinter.com/download/download-15-802.html)，点击 `DOWNLOAD` 安装。
+- C-Lodop：[Lodop / C-Lodop 下载中心](https://www.lodop.net/download.html)，下载 `Windows32版` 里的 `Web打印服务 C-Lodop` / `CLodop_Setup_for_Win32NT.exe`。
 
 ## 使用流程
 
